@@ -16,6 +16,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +28,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -44,6 +48,8 @@ type Config struct {
 	Stage2TimeoutMs     int      `json:"stage2_timeout_ms"`     // timeout/error => reject (fail closed)
 	MaxEntries          int      `json:"max_entries"`           // prompts remembered for cache entries (FIFO bound)
 	OnUnknown           string   `json:"on_unknown"`            // hit on an entry whose question we never saw: "reject" (default) or "serve"
+
+	BestBefore BestBeforeConfig `json:"best_before"` // freshness checks for time-sensitive answers (see freshness.go)
 }
 
 type decision struct {
@@ -57,6 +63,18 @@ type decision struct {
 	Latency        time.Duration
 	Regenerated    string // "", "true", "failed", "skipped"
 	RegenRequestID string
+	CacheID        string
+
+	// Best-Before
+	Freshness        string // within-deadline | rechecked-fresh | stale | check-failed | not-time-sensitive
+	FreshDeadline    time.Time
+	ClaimsChecked    int
+	StaleClaims      int
+	MinScore         int
+	CheckLatency     time.Duration
+	Evidence         string // evidence text for the regeneration (sources only)
+	EvidenceInjected string // "injected" | "not-injected" (regeneration after a stale claim)
+	CacheDelete      string // "ok" or the reason removing the old entry failed
 }
 
 type rawRequest struct {
@@ -78,8 +96,12 @@ type reqState struct {
 }
 
 type storedPrompt struct {
-	prompt string
-	system string // exact system/developer prefix the answer was generated with
+	prompt    string
+	system    string    // exact system/developer prefix the answer was generated with
+	cachedAt  time.Time // when the answer was cached
+	checkedAt time.Time // last time a freshness check found no stale claim
+	stale     bool      // a freshness check found a stale claim: never serve
+	evidence  string    // fresh source lines from that check, reused for every regeneration
 }
 
 const (
@@ -92,6 +114,11 @@ var (
 	keyPrompt = schemas.BifrostContextKey("cacheguard-prompt")
 	keySystem = schemas.BifrostContextKey("cacheguard-system")
 	keyState  = schemas.BifrostContextKey("cacheguard-state")
+	keyRegen  = schemas.BifrostContextKey("cacheguard-is-regeneration") // bool: this request is our own regeneration
+
+	// Secret marker for our own regeneration requests (random per process), so a client
+	// cannot pretend to be a regeneration or inject evidence.
+	loopbackToken string
 
 	cfg       Config
 	ruleOpts  guard.Options
@@ -142,6 +169,14 @@ func Init(config any) error {
 	if h := u.Hostname(); !cfg.AllowRemoteLoopback && h != "127.0.0.1" && h != "localhost" && h != "::1" {
 		return fmt.Errorf("cacheguard: loopback_url must point at this Bifrost (localhost); set allow_remote_loopback to override")
 	}
+	if err := initBestBefore(); err != nil {
+		return err
+	}
+	var tok [16]byte
+	if _, err := rand.Read(tok[:]); err != nil {
+		return fmt.Errorf("cacheguard: %w", err)
+	}
+	loopbackToken = hex.EncodeToString(tok[:])
 	ruleOpts = guard.Options{Disabled: map[string]bool{}}
 	for _, r := range cfg.DisableRules {
 		ruleOpts.Disabled[r] = true
@@ -184,6 +219,16 @@ func PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*sche
 	if req == nil {
 		return req, nil, nil
 	}
+	if st, ok := ctx.Value(keyState).(*reqState); ok && st.raw != nil && loopbackToken != "" &&
+		headerValue(st.raw.Headers, loopbackMark) == loopbackToken {
+		ctx.SetValue(keyRegen, true)
+		if ev := headerValue(st.raw.Headers, evidenceHeader); ev != "" {
+			if b, err := base64.StdEncoding.DecodeString(ev); err == nil && len(b) > 0 {
+				ctx.SetValue(evidenceTextKey, string(b))
+				ctx.SetValue(evidenceDoneKey, new(atomic.Bool))
+			}
+		}
+	}
 	prompt, system, why := analyse(req)
 	if why != "" {
 		// Not in the supported surface: allow exact-match caching only for this request,
@@ -205,7 +250,18 @@ func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bif
 	}
 	ef := resp.GetExtraFields()
 	if ef == nil || ef.CacheDebug == nil || ef.CacheDebug.CacheID == nil {
-		return resp, bifrostErr, nil // cache did not run for this request
+		// Cache did not run for this request. A regeneration sent without a cache key
+		// still reports whether the evidence was used.
+		if regen, _ := ctx.Value(keyRegen).(bool); regen {
+			if done, ok := ctx.Value(evidenceDoneKey).(*atomic.Bool); ok {
+				injected := "not-injected"
+				if done.Load() {
+					injected = "injected"
+				}
+				publish(ctx, &decision{Action: "generated", EvidenceInjected: injected})
+			}
+		}
+		return resp, bifrostErr, nil
 	}
 	cd := ef.CacheDebug
 	prompt, _ := ctx.Value(keyPrompt).(string)
@@ -214,14 +270,29 @@ func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bif
 	if !cd.CacheHit {
 		// The semantic cache will store this answer under CacheID: remember its question.
 		if prompt != "" {
-			store.put(*cd.CacheID, storedPrompt{prompt: prompt, system: system})
+			now := timeNow()
+			entry := storedPrompt{prompt: prompt, system: system, cachedAt: now}
+			injected := ""
+			if done, ok := ctx.Value(evidenceDoneKey).(*atomic.Bool); ok {
+				injected = "not-injected"
+				if done.Load() {
+					injected, entry.checkedAt = "injected", now // built from sources fetched just now
+				}
+			}
+			store.put(*cd.CacheID, entry)
+			if regen, _ := ctx.Value(keyRegen).(bool); regen {
+				publish(ctx, &decision{Action: "generated", EvidenceInjected: injected})
+			}
+			if injected != "injected" && bifrostErr == nil {
+				checkOnStore(*cd.CacheID, prompt, answerText(resp))
+			}
 		}
 		dbg("post-llm MISS cache_id=%s remembered=%v", *cd.CacheID, prompt != "")
 		return resp, bifrostErr, nil
 	}
 
 	start := time.Now()
-	d := &decision{Action: "pass", HitType: deref(cd.HitType)}
+	d := &decision{Action: "pass", HitType: deref(cd.HitType), CacheID: *cd.CacheID, MinScore: -1}
 	if cd.Similarity != nil {
 		d.Similarity = *cd.Similarity
 	}
@@ -258,6 +329,12 @@ func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bif
 		}
 	}
 	d.Latency = time.Since(start)
+	// Our own regeneration request never re-runs the freshness check (it would recurse);
+	// it can only hit an identical question, and it is sent without the cache key when
+	// the old entry could not be removed.
+	if regen, _ := ctx.Value(keyRegen).(bool); !regen && (d.Action == "pass" || d.Action == "unverified") {
+		bestBeforeOnHit(d, resp, prompt, cached, known)
+	}
 	publish(ctx, d)
 	ctx.Log(schemas.LogLevelInfo, fmt.Sprintf("cacheguard: %s hit -> %s (%s %s) in %s", d.HitType, d.Action, d.Reason, d.Detail, d.Latency))
 	dbg("post-llm HIT %s cache_id=%s -> %s %s %s", d.HitType, *cd.CacheID, d.Action, d.Reason, d.Detail)
@@ -322,11 +399,24 @@ func regenerate(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *sch
 	case raw == nil:
 		fail("original request not available")
 		return
-	case headerValue(raw.Headers, loopbackMark) != "":
+	case loopbackToken != "" && headerValue(raw.Headers, loopbackMark) == loopbackToken:
 		fail("request was already a regeneration")
 		return
 	}
-	status, headers, body, err := loopback(ctx, raw)
+	keepCacheKey := true
+	if d.Reason == "stale-claim" || d.Reason == "known-stale" || d.Reason == "freshness-check-failed" {
+		// The regeneration has the same question, so it would hit this same entry again.
+		// Remove the entry first, so the regenerated answer is cached in its place. If that
+		// fails, regenerate without the cache so the old entry cannot be hit again.
+		if err := deleteCacheEntry(d.CacheID); err != nil {
+			keepCacheKey = false
+			d.CacheDelete = "failed: " + err.Error()
+			dbg("could not delete stale entry %s: %v", d.CacheID, err)
+		} else {
+			d.CacheDelete = "ok"
+		}
+	}
+	status, headers, body, err := loopback(ctx, raw, d.Evidence, keepCacheKey)
 	if err != nil {
 		fail(err.Error())
 		return
@@ -338,6 +428,12 @@ func regenerate(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *sch
 	}
 	d.RegenRequestID = headerValue(headers, "x-bifrost-request-id")
 	d.Regenerated = "true"
+	if d.Evidence != "" {
+		d.EvidenceInjected = headerValue(headers, hdrPrefix+"evidence")
+		if d.EvidenceInjected == "" {
+			d.EvidenceInjected = "not-injected"
+		}
+	}
 }
 
 // ---------------------------------------------------------------- helpers
@@ -346,6 +442,32 @@ func (d *decision) headers() map[string]string {
 	h := map[string]string{
 		hdrPrefix + "decision": d.Action,
 		hdrPrefix + "mode":     cfg.Mode,
+	}
+	if d.Action == "generated" { // our own regeneration request: only report evidence use
+		if d.EvidenceInjected != "" {
+			h[hdrPrefix+"evidence"] = d.EvidenceInjected
+		}
+		return h
+	}
+	if d.Freshness != "" {
+		h[hdrPrefix+"freshness"] = d.Freshness
+		if !d.FreshDeadline.IsZero() {
+			h[hdrPrefix+"freshness-deadline"] = d.FreshDeadline.UTC().Format(time.RFC3339)
+		}
+		if d.ClaimsChecked > 0 || d.StaleClaims > 0 {
+			h[hdrPrefix+"claims-checked"] = fmt.Sprint(d.ClaimsChecked)
+			h[hdrPrefix+"stale-claims"] = fmt.Sprint(d.StaleClaims)
+			h[hdrPrefix+"freshness-check-ms"] = fmt.Sprint(d.CheckLatency.Milliseconds())
+		}
+		if d.MinScore >= 0 {
+			h[hdrPrefix+"min-freshness-score"] = fmt.Sprint(d.MinScore)
+		}
+	}
+	if d.EvidenceInjected != "" {
+		h[hdrPrefix+"evidence"] = d.EvidenceInjected
+	}
+	if d.CacheDelete != "" {
+		h[hdrPrefix+"old-entry-removed"] = headerSafe(d.CacheDelete)
 	}
 	if d.Reason != "" {
 		h[hdrPrefix+"reason"] = d.Reason
@@ -359,10 +481,12 @@ func (d *decision) headers() map[string]string {
 	if d.Stage == 2 {
 		h[hdrPrefix+"score"] = fmt.Sprintf("%.4f", d.Score)
 	}
-	if d.Action != "bypass" {
+	if d.Action != "bypass" && d.HitType != "" {
 		h[hdrPrefix+"decision-latency-us"] = fmt.Sprint(d.Latency.Microseconds())
 		h[hdrPrefix+"candidate-hit-type"] = d.HitType
-		h[hdrPrefix+"candidate-similarity"] = fmt.Sprintf("%.4f", d.Similarity)
+		if d.HitType == "semantic" {
+			h[hdrPrefix+"candidate-similarity"] = fmt.Sprintf("%.4f", d.Similarity)
+		}
 	}
 	if d.Action == "reject" && cfg.Mode == "enforce" {
 		// The candidate was not served, so the response is not a cache hit.
@@ -446,14 +570,18 @@ func forwardHeader(k string) bool {
 	switch k {
 	case "authorization", "x-api-key", "content-type", "accept":
 		return true
-	case "x-bf-cache-type", loopbackMark:
+	case "x-bf-cache-type", "x-bf-cache-threshold", loopbackMark, evidenceHeader:
 		return false
 	}
 	return strings.HasPrefix(k, "x-bf-")
 }
 
-// loopback re-sends the original request to this Bifrost with semantic lookup disabled.
-func loopback(ctx *schemas.BifrostContext, raw *rawRequest) (int, map[string]string, []byte, error) {
+// loopback re-sends the original request to this Bifrost. Semantic matching is
+// effectively off (threshold 1.0: only an identical question matches), but the new
+// answer is cached normally under the same cache key, embeddings included.
+// evidence (optional) is added to the model input by the cacheguard-evidence plugin.
+// keepCacheKey=false sends the request without the cache key (no lookup, no store).
+func loopback(ctx *schemas.BifrostContext, raw *rawRequest, evidence string, keepCacheKey bool) (int, map[string]string, []byte, error) {
 	if !strings.HasPrefix(raw.Path, "/") {
 		return 0, nil, nil, errors.New("invalid request path")
 	}
@@ -478,8 +606,14 @@ func loopback(ctx *schemas.BifrostContext, raw *rawRequest) (int, map[string]str
 			req.Header.Set(k, v)
 		}
 	}
-	req.Header.Set("x-bf-cache-type", "direct") // exact-match only: cannot produce another semantic hit
-	req.Header.Set(loopbackMark, "1")
+	req.Header.Set("x-bf-cache-threshold", "1") // only an identical question can match
+	if !keepCacheKey {
+		req.Header.Del("x-bf-cache-key")
+	}
+	if evidence != "" {
+		req.Header.Set(evidenceHeader, base64.StdEncoding.EncodeToString([]byte(evidence)))
+	}
+	req.Header.Set(loopbackMark, loopbackToken)
 	res, err := regenHTTP.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
@@ -604,6 +738,18 @@ func (s *promptStore) put(id string, p storedPrompt) {
 	for len(s.order) > s.max {
 		delete(s.m, s.order[0])
 		s.order = s.order[1:]
+	}
+}
+
+func (s *promptStore) update(id string, f func(*storedPrompt)) {
+	if s == nil || id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p, ok := s.m[id]; ok {
+		f(&p)
+		s.m[id] = p
 	}
 }
 

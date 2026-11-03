@@ -119,8 +119,8 @@ func TestRegenerateReplacesAnswerAndHeadersAreTruthful(t *testing.T) {
 	if string(resp.Body) != `{"fresh":true}` || d.Regenerated != "true" || d.RegenRequestID != "regen-1" {
 		t.Fatalf("not regenerated: body=%s d=%+v", resp.Body, d)
 	}
-	if got.Header.Get("x-bf-cache-type") != "direct" || got.Header.Get(loopbackMark) != "1" {
-		t.Error("loopback must be direct-only and marked")
+	if got.Header.Get("x-bf-cache-threshold") != "1" || got.Header.Get("x-bf-cache-type") != "" || got.Header.Get(loopbackMark) != loopbackToken || loopbackToken == "" {
+		t.Error("loopback must use threshold 1, carry the secret marker and drop the client's cache type")
 	}
 	if got.Header.Get("Cookie") != "" || got.Header.Get("Authorization") != "Bearer k" {
 		t.Error("header allowlist not applied")
@@ -145,7 +145,7 @@ func TestNoSecondRegeneration(t *testing.T) {
 	mustInit(t, map[string]any{"loopback_url": srv.URL})
 	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
 	req := &schemas.HTTPRequest{Method: "POST", Path: "/v1/chat/completions", Body: []byte(`{}`),
-		Headers: map[string]string{loopbackMark: "1"}}
+		Headers: map[string]string{loopbackMark: loopbackToken}}
 	resp := &schemas.HTTPResponse{StatusCode: 200, Headers: map[string]string{}, Body: []byte(`{"stale":true}`)}
 	d := rejected()
 	regenerate(ctx, req, resp, d)

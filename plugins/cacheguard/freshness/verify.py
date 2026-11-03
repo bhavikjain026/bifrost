@@ -245,7 +245,7 @@ def judge_decide(claim: Claim, lines: list[Line], question: str, model: str, oll
         "verdict": {"type": "string", "enum": ["supported", "contradicted", "not_enough_info"]},
         "lines": {"type": "array", "items": {"type": "integer"}},
         "newer_value": {"type": "string"}}, "required": ["verdict", "lines"]}
-    body = {"model": model, "stream": False, "format": schema, "options": {"temperature": 0},
+    body = {"model": model, "stream": False, "format": schema, "options": {"temperature": 0, "num_ctx": int(os.environ.get("FRESHNESS_NUM_CTX", "16384"))},
             "messages": [{"role": "user", "content": prompt}]}
     req = urllib.request.Request(ollama_url.rstrip("/") + "/api/chat", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
