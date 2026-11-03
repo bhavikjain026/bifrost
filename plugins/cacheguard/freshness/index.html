@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Best-Before · claim freshness check</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#272b35; --text:#e7e9ee; --dim:#9aa1ad; --fresh:#3fb27f; --unv:#d9a441; --stale:#e05d5d; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 -apple-system, system-ui, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 20px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { color: var(--dim); margin: 0 0 20px; }
+  label { display:block; font-size:13px; color:var(--dim); margin:14px 0 6px; }
+  input, textarea { width:100%; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px 12px; font:inherit; }
+  textarea { min-height: 150px; resize: vertical; }
+  button { margin-top:14px; background:#4c6fff; color:#fff; border:0; border-radius:8px; padding:10px 18px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  .summary { margin:22px 0 10px; color:var(--dim); font-size:14px; }
+  .claim { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--line); border-radius:8px; padding:12px 14px; margin:10px 0; }
+  .claim.fresh { border-left-color:var(--fresh); } .claim.unverified { border-left-color:var(--unv); } .claim.stale { border-left-color:var(--stale); }
+  .claim.plain { opacity:.55; }
+  .row { display:flex; gap:12px; align-items:baseline; }
+  .score { font-weight:700; font-size:20px; min-width:46px; text-align:right; }
+  .fresh .score { color:var(--fresh); } .unverified .score { color:var(--unv); } .stale .score { color:var(--stale); }
+  .meta { color:var(--dim); font-size:13px; margin-top:4px; }
+  .ev { font-size:13px; margin-top:8px; padding-left:10px; border-left:2px solid var(--line); }
+  .ev a { color:#8fb0ff; }
+  .err { color: var(--stale); margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Best-Before</h1>
+  <p class="sub">Paste any LLM answer. Claims likely to go stale are re-checked against live web sources (Tavily) and each gets a freshness score.</p>
+  <label for="q">Question (optional, improves the search)</label>
+  <input id="q" placeholder="e.g. How much does ChatGPT Plus cost?">
+  <label for="a">Answer to check</label>
+  <textarea id="a" placeholder="Paste the answer here"></textarea>
+  <button id="go">Check freshness</button>
+  <div id="err" class="err"></div>
+  <div id="summary" class="summary"></div>
+  <div id="out"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+$("go").onclick = async () => {
+  $("go").disabled = true; $("err").textContent = ""; $("out").innerHTML = ""; $("summary").textContent = "Checking…";
+  try {
+    const r = await fetch("/check", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({answer: $("a").value, question: $("q").value})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    const s = d.summary;
+    $("summary").textContent = `${s.claims} sentences · ${s.flagged} flagged · ${s.checked} checked · ${s.stale} stale · ${s.credits} Tavily credits · ${s.mode} · ${s.ms} ms`;
+    $("out").innerHTML = d.claims.map(c => {
+      if (!c.flagged) return `<div class="claim plain"><div class="row"><div class="score">–</div><div>${esc(c.text)}</div></div><div class="meta">not time-sensitive by our rules</div></div>`;
+      const ev = (c.evidence || []).map(e => `<div class="ev">“${esc(e.line)}”<br><a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.title || e.url)}</a>${e.published ? " · " + esc(e.published.slice(0,10)) : ""}</div>`).join("");
+      const newer = c.newer_value ? ` · newer value: <b>${esc(c.newer_value)}</b>` : "";
+      return `<div class="claim ${esc(c.label)}"><div class="row"><div class="score">${c.verdict === "not-checked" ? "?" : esc(c.score)}</div><div>${esc(c.text)}</div></div>
+        <div class="meta">${esc(c.label)} · ${esc(c.verdict)} · ${esc(c.category)} (${esc((c.rules||[]).join(", "))})${newer} · ${esc(c.reason)}</div>${ev}</div>`;
+    }).join("");
+  } catch (e) { $("err").textContent = "Error: " + e.message; $("summary").textContent = ""; }
+  $("go").disabled = false;
+};
+</script>
+</body>
+</html>
