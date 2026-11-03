@@ -55,38 +55,65 @@ var (
 	sentenceEnd = regexp.MustCompile(`[.?!]\s*$`)
 )
 
-// Verify returns whether the cached answer for cachedPrompt may be served for newPrompt.
+// Rule names, usable in Options.Disabled.
+const (
+	RuleLanguage     = "language"
+	RuleNegation     = "negation"
+	RuleNumber       = "number"
+	RuleTime         = "time"
+	RuleEntity       = "entity"
+	RuleAntonym      = "antonym"
+	RuleSubstitution = "substitution"
+)
+
+// AllRules lists every stage-1 rule in evaluation order.
+var AllRules = []string{RuleLanguage, RuleNegation, RuleNumber, RuleTime, RuleEntity, RuleAntonym, RuleSubstitution}
+
+// Options tunes the checker. The zero value enables every rule.
+type Options struct {
+	Disabled map[string]bool
+}
+
+func (o Options) on(rule string) bool { return !o.Disabled[rule] }
+
+// Verify returns whether the cached answer for cachedPrompt may be served for newPrompt,
+// with every rule enabled.
 func Verify(newPrompt, cachedPrompt string) Verdict {
+	return VerifyWith(newPrompt, cachedPrompt, Options{})
+}
+
+// VerifyWith is Verify with configurable rules.
+func VerifyWith(newPrompt, cachedPrompt string, o Options) Verdict {
 	if norm(newPrompt) == norm(cachedPrompt) {
 		return Verdict{Reuse: true}
 	}
 	a, b := tokens(newPrompt), tokens(cachedPrompt)
 
-	if la, lb := scriptShare(newPrompt), scriptShare(cachedPrompt); (la > 0.3) != (lb > 0.3) {
+	if la, lb := scriptShare(newPrompt), scriptShare(cachedPrompt); o.on(RuleLanguage) && (la > 0.3) != (lb > 0.3) {
 		return Verdict{Reason: "language", Detail: "different script"}
 	}
-	if countNeg(a) != countNeg(b) {
+	if o.on(RuleNegation) && countNeg(a) != countNeg(b) {
 		return Verdict{Reason: "negation", Detail: "negation word count differs"}
 	}
-	if d := diffList(numbers(a), numbers(b)); d != "" {
+	if d := diffList(numbers(a), numbers(b)); o.on(RuleNumber) && d != "" {
 		return Verdict{Reason: "number", Detail: d}
 	}
-	if d := diffList(filter(a, deixis), filter(b, deixis)); d != "" {
+	if d := diffList(filter(a, deixis), filter(b, deixis)); o.on(RuleTime) && d != "" {
 		return Verdict{Reason: "time", Detail: d}
 	}
-	if d := missingEntity(newPrompt, cachedPrompt); d != "" {
+	if d := missingEntity(newPrompt, cachedPrompt); o.on(RuleEntity) && d != "" {
 		return Verdict{Reason: "entity", Detail: d}
 	}
 
 	ca, cb := content(a), content(b)
 	onlyA, onlyB, common := multisetDiff(ca, cb)
-	if d := antonymHit(onlyA, onlyB); d != "" {
+	if d := antonymHit(onlyA, onlyB); o.on(RuleAntonym) && d != "" {
 		return Verdict{Reason: "antonym", Detail: d}
 	}
 	// Minimal pair: same sentence, one or two content words swapped for others.
 	// The swapped words are then the point of the question (staging vs production,
 	// trial vs enterprise accounts), so the answers differ.
-	if len(onlyA) >= 1 && len(onlyA) <= 2 && len(onlyB) >= 1 && len(onlyB) <= 2 && len(common) >= 2 {
+	if o.on(RuleSubstitution) && len(onlyA) >= 1 && len(onlyA) <= 2 && len(onlyB) >= 1 && len(onlyB) <= 2 && len(common) >= 2 {
 		return Verdict{Reason: "substitution", Detail: strings.Join(onlyA, ",") + " vs " + strings.Join(onlyB, ",")}
 	}
 	return Verdict{Reuse: true}

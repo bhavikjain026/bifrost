@@ -2,27 +2,26 @@
 // served, and regenerates the answer when the cached entry was written for a
 // question that only *looks* similar (with vs without, v2 vs v3, EU vs US ...).
 //
-// It runs on a stock Bifrost build through the documented dynamic-plugin interface
-// and needs no change to Bifrost's own code. Register it with placement "pre_builtin"
-// so it runs before the semantic_cache plugin: its PostLLMHook then sees every
-// cache hit (core replays post hooks for the plugins that ran before a short-circuit).
+// It runs on an unmodified, dynamically built Bifrost through the documented plugin
+// interface. Register it with placement "pre_builtin" so it runs before semantic_cache:
+//   - its PreLLMHook runs first, so it can restrict unsupported requests to exact-match
+//     caching (no unchecked semantic replay);
+//   - its PostLLMHook sees every cache hit (core replays post hooks for the plugins
+//     that ran before a short-circuit) and decides whether the hit may be served.
 //
-// Flow per request:
-//
-//	HTTPTransportPreHook  keep a copy of the raw HTTP request (for regeneration)
-//	PreLLMHook            remember the user's prompt text
-//	PostLLMHook           cache MISS -> remember "cache entry ID -> prompt"
-//	                      cache HIT  -> stage 1 rules (+ optional stage 2 model)
-//	HTTPTransportPostHook reject -> re-ask Bifrost with x-bf-cache-type: direct
-//	                      and replace the response body; always add decision headers
+// Supported surface (v1): non-streaming, single-turn text chat/text completions.
+// Everything else is limited to exact-match caching for that request.
 package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -30,28 +29,34 @@ import (
 
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/plugins/cacheguard/guard"
+	"github.com/maximhq/bifrost/plugins/semanticcache"
 )
 
 // Config is read from the plugin's "config" block.
 type Config struct {
-	Mode            string  `json:"mode"`              // "enforce" (default): replace rejected hits; "shadow": headers only
-	LoopbackURL     string  `json:"loopback_url"`      // this Bifrost's own address, default http://127.0.0.1:8080
-	Stage2URL       string  `json:"stage2_url"`        // optional cross-encoder service, e.g. http://127.0.0.1:8099/score
-	Stage2Threshold float64 `json:"stage2_threshold"`  // serve only if stage-2 score >= this
-	Stage2TimeoutMs int     `json:"stage2_timeout_ms"` // fail closed (reject) when exceeded
-	MaxEntries      int     `json:"max_entries"`       // prompts remembered for cache entries
-	OnUnknown       string  `json:"on_unknown"`        // hit on an entry we never saw written: "serve" (default) or "reject"
+	Mode                string   `json:"mode"`                  // "enforce" (default): replace rejected hits; "shadow": headers only
+	LoopbackURL         string   `json:"loopback_url"`          // this Bifrost's own address, default http://127.0.0.1:8080
+	AllowRemoteLoopback bool     `json:"allow_remote_loopback"` // loopback_url must be localhost unless this is true
+	RegenTimeoutMs      int      `json:"regen_timeout_ms"`      // limit for the one regeneration request
+	DisableRules        []string `json:"disable_rules"`         // stage-1 rules to switch off, e.g. ["substitution"]
+	Stage2URL           string   `json:"stage2_url"`            // optional cross-encoder service, e.g. http://127.0.0.1:8099/score
+	Stage2Threshold     float64  `json:"stage2_threshold"`      // serve only if stage-2 score >= this
+	Stage2TimeoutMs     int      `json:"stage2_timeout_ms"`     // timeout/error => reject (fail closed)
+	MaxEntries          int      `json:"max_entries"`           // prompts remembered for cache entries (FIFO bound)
+	OnUnknown           string   `json:"on_unknown"`            // hit on an entry whose question we never saw: "reject" (default) or "serve"
 }
 
 type decision struct {
-	Action     string // "pass" | "reject" | "unverified"
-	Reason     string
-	Detail     string
-	Stage      int
-	HitType    string
-	Similarity float64
-	Score      float64
-	Latency    time.Duration
+	Action         string // "pass" | "reject" | "unverified" | "bypass"
+	Reason         string
+	Detail         string
+	Stage          int
+	HitType        string
+	Similarity     float64
+	Score          float64
+	Latency        time.Duration
+	Regenerated    string // "", "true", "failed", "skipped"
+	RegenRequestID string
 }
 
 type rawRequest struct {
@@ -62,30 +67,37 @@ type rawRequest struct {
 	Body    []byte
 }
 
-const (
-	pluginName   = "cacheguard"
-	bypassHeader = "x-cacheguard-loopback"
-	hdrPrefix    = "x-bifrost-cacheguard-"
-)
-
 // reqState is created by the HTTP pre-hook and shared by pointer with the LLM hooks.
-// Bifrost gives HTTP hooks and LLM hooks different context objects, but values set
-// in the HTTP pre-hook are copied into the request, so the LLM hooks can read (and
-// fill in) this holder, and the HTTP post-hooks see the result.
+// Bifrost gives HTTP hooks and LLM hooks different context objects, but values set in
+// the HTTP pre-hook are copied into the request, so the LLM hooks can read (and fill in)
+// this holder, and the HTTP post-hooks see the result.
 type reqState struct {
 	mu       sync.Mutex
 	raw      *rawRequest
 	decision *decision
 }
 
+type storedPrompt struct {
+	prompt string
+	system string // exact system/developer prefix the answer was generated with
+}
+
+const (
+	pluginName   = "cacheguard"
+	loopbackMark = "x-cacheguard-loopback"
+	hdrPrefix    = "x-bifrost-cacheguard-"
+)
+
 var (
 	keyPrompt = schemas.BifrostContextKey("cacheguard-prompt")
+	keySystem = schemas.BifrostContextKey("cacheguard-system")
 	keyState  = schemas.BifrostContextKey("cacheguard-state")
 
-	cfg    Config
-	store  *promptStore
-	client *http.Client
-	debug  = os.Getenv("CACHEGUARD_DEBUG") == "1"
+	cfg       Config
+	ruleOpts  guard.Options
+	store     *promptStore
+	regenHTTP *http.Client
+	debug     = os.Getenv("CACHEGUARD_DEBUG") == "1"
 
 	// Fallback channel between LLM hooks and HTTP hooks, keyed by Bifrost's request ID
 	// (also returned to the client as x-bifrost-request-id).
@@ -106,8 +118,8 @@ func dbg(format string, args ...any) {
 // ---------------------------------------------------------------- lifecycle
 
 func Init(config any) error {
-	cfg = Config{Mode: "enforce", LoopbackURL: "http://127.0.0.1:8080", Stage2Threshold: 0.5,
-		Stage2TimeoutMs: 150, MaxEntries: 100_000, OnUnknown: "serve"}
+	cfg = Config{Mode: "enforce", LoopbackURL: "http://127.0.0.1:8080", RegenTimeoutMs: 120_000,
+		Stage2Threshold: 0.5, Stage2TimeoutMs: 150, MaxEntries: 100_000, OnUnknown: "reject"}
 	if config != nil {
 		b, err := json.Marshal(config)
 		if err != nil {
@@ -120,11 +132,30 @@ func Init(config any) error {
 	if cfg.Mode != "enforce" && cfg.Mode != "shadow" {
 		return fmt.Errorf("cacheguard: mode must be \"enforce\" or \"shadow\", got %q", cfg.Mode)
 	}
+	if cfg.OnUnknown != "reject" && cfg.OnUnknown != "serve" {
+		return fmt.Errorf("cacheguard: on_unknown must be \"reject\" or \"serve\", got %q", cfg.OnUnknown)
+	}
+	u, err := url.Parse(cfg.LoopbackURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("cacheguard: loopback_url must be an http(s) URL, got %q", cfg.LoopbackURL)
+	}
+	if h := u.Hostname(); !cfg.AllowRemoteLoopback && h != "127.0.0.1" && h != "localhost" && h != "::1" {
+		return fmt.Errorf("cacheguard: loopback_url must point at this Bifrost (localhost); set allow_remote_loopback to override")
+	}
+	ruleOpts = guard.Options{Disabled: map[string]bool{}}
+	for _, r := range cfg.DisableRules {
+		ruleOpts.Disabled[r] = true
+	}
 	if cfg.MaxEntries <= 0 {
 		cfg.MaxEntries = 100_000
 	}
 	store = newPromptStore(cfg.MaxEntries)
-	client = &http.Client{Timeout: 120 * time.Second}
+	regenHTTP = &http.Client{
+		Timeout: time.Duration(cfg.RegenTimeoutMs) * time.Millisecond,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse // never follow redirects off this gateway
+		},
+	}
 	return nil
 }
 
@@ -150,10 +181,21 @@ func HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest)
 }
 
 func PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
-	if p := promptText(req); p != "" {
-		ctx.SetValue(keyPrompt, p)
-		dbg("pre-llm prompt=%q", p)
+	if req == nil {
+		return req, nil, nil
 	}
+	prompt, system, why := analyse(req)
+	if why != "" {
+		// Not in the supported surface: allow exact-match caching only for this request,
+		// so no unchecked semantic replay can happen.
+		ctx.SetValue(semanticcache.CacheTypeKey, semanticcache.CacheTypeDirect)
+		publish(ctx, &decision{Action: "bypass", Reason: why})
+		dbg("pre-llm: %s -> semantic lookup disabled for this request", why)
+		return req, nil, nil
+	}
+	ctx.SetValue(keyPrompt, prompt)
+	ctx.SetValue(keySystem, system)
+	dbg("pre-llm prompt=%q", prompt)
 	return req, nil, nil
 }
 
@@ -163,16 +205,16 @@ func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bif
 	}
 	ef := resp.GetExtraFields()
 	if ef == nil || ef.CacheDebug == nil || ef.CacheDebug.CacheID == nil {
-		dbg("post-llm: no cache metadata on this response")
 		return resp, bifrostErr, nil // cache did not run for this request
 	}
 	cd := ef.CacheDebug
 	prompt, _ := ctx.Value(keyPrompt).(string)
+	system, _ := ctx.Value(keySystem).(string)
 
 	if !cd.CacheHit {
 		// The semantic cache will store this answer under CacheID: remember its question.
 		if prompt != "" {
-			store.put(*cd.CacheID, prompt)
+			store.put(*cd.CacheID, storedPrompt{prompt: prompt, system: system})
 		}
 		dbg("post-llm MISS cache_id=%s remembered=%v", *cd.CacheID, prompt != "")
 		return resp, bifrostErr, nil
@@ -187,19 +229,25 @@ func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bif
 	switch {
 	case d.HitType == "direct":
 		d.Reason = "exact-match"
-	case !known || prompt == "":
-		d.Action, d.Reason = "unverified", "unknown-entry"
-		if cfg.OnUnknown == "reject" {
-			d.Action = "reject"
+	case prompt == "":
+		// Request outside the supported surface somehow reached a semantic hit.
+		d.Action, d.Reason = "reject", "unsupported-request"
+	case !known:
+		// We never saw the question this entry was written for (e.g. after a restart).
+		d.Action, d.Reason = "reject", "unknown-entry"
+		if cfg.OnUnknown == "serve" {
+			d.Action = "unverified"
 		}
+	case cached.system != system:
+		d.Action, d.Reason, d.Stage = "reject", "system-prompt-differs", 1
 	default:
-		v := guard.Verify(prompt, cached)
+		v := guard.VerifyWith(prompt, cached.prompt, ruleOpts)
 		d.Stage = 1
 		if !v.Reuse {
 			d.Action, d.Reason, d.Detail = "reject", v.Reason, v.Detail
 		} else if cfg.Stage2URL != "" {
 			d.Stage = 2
-			score, err := stage2Score(prompt, cached)
+			score, err := stage2Score(prompt, cached.prompt)
 			d.Score = score
 			switch {
 			case err != nil:
@@ -211,41 +259,51 @@ func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bif
 	}
 	d.Latency = time.Since(start)
 	publish(ctx, d)
-	dbg("post-llm HIT %s cache_id=%s -> %s %s %s", d.HitType, *cd.CacheID, d.Action, d.Reason, d.Detail)
 	ctx.Log(schemas.LogLevelInfo, fmt.Sprintf("cacheguard: %s hit -> %s (%s %s) in %s", d.HitType, d.Action, d.Reason, d.Detail, d.Latency))
+	dbg("post-llm HIT %s cache_id=%s -> %s %s %s", d.HitType, *cd.CacheID, d.Action, d.Reason, d.Detail)
 	return resp, bifrostErr, nil
-}
-
-func HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error {
-	if resp == nil {
-		return nil
-	}
-	if d := lookup(ctx, resp.Headers, false); d != nil {
-		for k, v := range d.headers() {
-			resp.SetHeader(k, v)
-		}
-	}
-	return nil
 }
 
 func HTTPTransportPostHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponse) error {
 	if resp == nil {
 		return nil
 	}
-	d := lookup(ctx, resp.Headers, true)
-	dbg("http post-hook decision=%v", d != nil)
+	d := lookup(ctx, resp.Headers, false)
 	if d == nil {
 		return nil
 	}
 	if resp.Headers == nil {
 		resp.Headers = map[string]string{}
 	}
+	if d.Action == "reject" && cfg.Mode == "enforce" && d.Regenerated == "" {
+		regenerate(ctx, req, resp, d)
+	}
 	for k, v := range d.headers() {
 		resp.Headers[k] = v
 	}
-	if d.Action != "reject" || cfg.Mode != "enforce" {
+	return nil
+}
+
+// HTTPTransportResponseHeadersHook is the last point before headers are committed.
+// It makes the cache headers describe the answer actually served.
+func HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error {
+	if resp == nil {
 		return nil
 	}
+	d := lookup(ctx, resp.Headers, false)
+	if d == nil {
+		return nil
+	}
+	for k, v := range d.headers() {
+		resp.SetHeader(k, v)
+	}
+	return nil
+}
+
+// regenerate replaces a rejected cached answer with a freshly generated one by
+// re-sending the original request to this Bifrost with semantic lookup disabled.
+// Exactly one attempt; a request that is itself a regeneration is never regenerated again.
+func regenerate(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *schemas.HTTPResponse, d *decision) {
 	var raw *rawRequest
 	if st, ok := ctx.Value(keyState).(*reqState); ok {
 		raw = st.raw
@@ -253,32 +311,214 @@ func HTTPTransportPostHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest
 	if raw == nil && req != nil && len(req.Body) > 0 {
 		raw = &rawRequest{Method: req.Method, Path: req.Path, Query: copyMap(req.Query), Headers: copyMap(req.Headers), Body: append([]byte(nil), req.Body...)}
 	}
-	if raw == nil {
-		resp.Headers[hdrPrefix+"regenerated"] = "false-no-request"
-		return nil
-	}
-	status, headers, body, err := loopback(raw)
-	if err != nil {
+	fail := func(why string) {
 		// Fail closed: never serve an answer we just judged to be for another question.
 		resp.StatusCode = http.StatusBadGateway
-		resp.Body = []byte(fmt.Sprintf(`{"error":{"message":"cacheguard: cached answer rejected and regeneration failed: %s"}}`, jsonEscape(err.Error())))
+		resp.Body = []byte(fmt.Sprintf(`{"error":{"type":"cacheguard_regeneration_failed","message":"cached answer rejected (%s) and regeneration failed: %s"}}`, jsonEscape(d.Reason), jsonEscape(why)))
 		resp.Headers["content-type"] = "application/json"
-		resp.Headers[hdrPrefix+"regenerated"] = "failed"
-		return nil
+		d.Regenerated = "failed"
+	}
+	switch {
+	case raw == nil:
+		fail("original request not available")
+		return
+	case headerValue(raw.Headers, loopbackMark) != "":
+		fail("request was already a regeneration")
+		return
+	}
+	status, headers, body, err := loopback(ctx, raw)
+	if err != nil {
+		fail(err.Error())
+		return
 	}
 	resp.StatusCode = status
 	resp.Body = body
-	for k, v := range headers {
-		lk := strings.ToLower(k)
-		if lk == "content-type" || strings.HasPrefix(lk, "x-bifrost-cache-") {
-			resp.Headers[lk] = v
-		}
+	if ct := headerValue(headers, "content-type"); ct != "" {
+		resp.Headers["content-type"] = ct
 	}
-	resp.Headers[hdrPrefix+"regenerated"] = "true"
-	return nil
+	d.RegenRequestID = headerValue(headers, "x-bifrost-request-id")
+	d.Regenerated = "true"
 }
 
 // ---------------------------------------------------------------- helpers
+
+func (d *decision) headers() map[string]string {
+	h := map[string]string{
+		hdrPrefix + "decision": d.Action,
+		hdrPrefix + "mode":     cfg.Mode,
+	}
+	if d.Reason != "" {
+		h[hdrPrefix+"reason"] = d.Reason
+	}
+	if d.Detail != "" {
+		h[hdrPrefix+"detail"] = headerSafe(d.Detail)
+	}
+	if d.Stage > 0 {
+		h[hdrPrefix+"stage"] = fmt.Sprint(d.Stage)
+	}
+	if d.Stage == 2 {
+		h[hdrPrefix+"score"] = fmt.Sprintf("%.4f", d.Score)
+	}
+	if d.Action != "bypass" {
+		h[hdrPrefix+"decision-latency-us"] = fmt.Sprint(d.Latency.Microseconds())
+		h[hdrPrefix+"candidate-hit-type"] = d.HitType
+		h[hdrPrefix+"candidate-similarity"] = fmt.Sprintf("%.4f", d.Similarity)
+	}
+	if d.Action == "reject" && cfg.Mode == "enforce" {
+		// The candidate was not served, so the response is not a cache hit.
+		h["x-bifrost-cache-hit"] = "false"
+		h["x-bifrost-cache-hit-type"] = "none"
+		if d.Regenerated != "" {
+			h[hdrPrefix+"regenerated"] = d.Regenerated
+		}
+		if d.RegenRequestID != "" {
+			h[hdrPrefix+"regeneration-request-id"] = d.RegenRequestID
+		}
+	}
+	return h
+}
+
+// analyse returns the user prompt and system prefix for supported requests, or a
+// reason why the request is outside the supported surface.
+func analyse(req *schemas.BifrostRequest) (prompt, system, why string) {
+	switch req.RequestType {
+	case schemas.ChatCompletionRequest:
+		cr := req.ChatRequest
+		if cr == nil {
+			return "", "", "no-chat-input"
+		}
+		if cr.Params != nil && len(cr.Params.Tools) > 0 {
+			return "", "", "tools"
+		}
+		var users, systems []string
+		for _, m := range cr.Input {
+			text, ok := messageText(m)
+			if !ok {
+				return "", "", "non-text-content"
+			}
+			switch m.Role {
+			case schemas.ChatMessageRoleUser:
+				users = append(users, text)
+			case schemas.ChatMessageRoleSystem, schemas.ChatMessageRoleDeveloper:
+				systems = append(systems, text)
+			default:
+				return "", "", "multi-turn"
+			}
+		}
+		if len(users) != 1 {
+			return "", "", "multi-turn"
+		}
+		return users[0], strings.Join(systems, "\n"), ""
+	case schemas.TextCompletionRequest:
+		tr := req.TextCompletionRequest
+		if tr == nil || tr.Input == nil || tr.Input.PromptStr == nil {
+			return "", "", "non-text-content"
+		}
+		return *tr.Input.PromptStr, "", ""
+	default:
+		if strings.HasSuffix(string(req.RequestType), "_stream") {
+			return "", "", "streaming"
+		}
+		return "", "", "unsupported-type:" + string(req.RequestType)
+	}
+}
+
+func messageText(m schemas.ChatMessage) (string, bool) {
+	if m.Content == nil {
+		return "", true
+	}
+	if m.Content.ContentStr != nil {
+		return *m.Content.ContentStr, true
+	}
+	var parts []string
+	for _, b := range m.Content.ContentBlocks {
+		if b.Type != schemas.ChatContentBlockTypeText || b.Text == nil {
+			return "", false
+		}
+		parts = append(parts, *b.Text)
+	}
+	return strings.Join(parts, "\n"), true
+}
+
+// Headers forwarded to the regeneration request: identity/governance and cache scoping only.
+func forwardHeader(k string) bool {
+	k = strings.ToLower(k)
+	switch k {
+	case "authorization", "x-api-key", "content-type", "accept":
+		return true
+	case "x-bf-cache-type", loopbackMark:
+		return false
+	}
+	return strings.HasPrefix(k, "x-bf-")
+}
+
+// loopback re-sends the original request to this Bifrost with semantic lookup disabled.
+func loopback(ctx *schemas.BifrostContext, raw *rawRequest) (int, map[string]string, []byte, error) {
+	if !strings.HasPrefix(raw.Path, "/") {
+		return 0, nil, nil, errors.New("invalid request path")
+	}
+	target := strings.TrimRight(cfg.LoopbackURL, "/") + raw.Path
+	if len(raw.Query) > 0 {
+		q := url.Values{}
+		for k, v := range raw.Query {
+			q.Set(k, v)
+		}
+		target += "?" + q.Encode()
+	}
+	var parent context.Context = context.Background()
+	if ctx != nil {
+		parent = ctx
+	}
+	req, err := http.NewRequestWithContext(parent, http.MethodPost, target, bytes.NewReader(raw.Body))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	for k, v := range raw.Headers {
+		if forwardHeader(k) {
+			req.Header.Set(k, v)
+		}
+	}
+	req.Header.Set("x-bf-cache-type", "direct") // exact-match only: cannot produce another semantic hit
+	req.Header.Set(loopbackMark, "1")
+	res, err := regenHTTP.Do(req)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	headers := map[string]string{}
+	for k := range res.Header {
+		headers[strings.ToLower(k)] = res.Header.Get(k)
+	}
+	return res.StatusCode, headers, body, nil
+}
+
+// stage2Score asks the optional cross-encoder service whether a and b ask the same thing.
+func stage2Score(a, b string) (float64, error) {
+	payload, _ := json.Marshal(map[string]string{"a": a, "b": b})
+	c := &http.Client{Timeout: time.Duration(cfg.Stage2TimeoutMs) * time.Millisecond}
+	res, err := c.Post(cfg.Stage2URL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("stage2 status %d", res.StatusCode)
+	}
+	var out struct {
+		Score *float64 `json:"score"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	if out.Score == nil || *out.Score != *out.Score { // missing or NaN
+		return 0, errors.New("stage2 returned no valid score")
+	}
+	return *out.Score, nil
+}
 
 // publish makes a decision visible to the HTTP hooks (shared holder + request-ID map).
 func publish(ctx *schemas.BifrostContext, d *decision) {
@@ -303,12 +543,7 @@ func lookup(ctx *schemas.BifrostContext, headers map[string]string, consume bool
 			return d
 		}
 	}
-	rid := ""
-	for k, v := range headers {
-		if strings.EqualFold(k, "x-bifrost-request-id") {
-			rid = v
-		}
-	}
+	rid := headerValue(headers, "x-bifrost-request-id")
 	if rid == "" {
 		return nil
 	}
@@ -325,8 +560,10 @@ func lookup(ctx *schemas.BifrostContext, headers map[string]string, consume bool
 	return v.(*timedDecision).d
 }
 
-var lastSweep time.Time
-var sweepMu sync.Mutex
+var (
+	lastSweep time.Time
+	sweepMu   sync.Mutex
+)
 
 // sweep drops request-ID entries older than two minutes.
 func sweep() {
@@ -344,144 +581,46 @@ func sweep() {
 	})
 }
 
-func (d *decision) headers() map[string]string {
-	h := map[string]string{
-		hdrPrefix + "decision": d.Action,
-		hdrPrefix + "mode":     cfg.Mode,
-	}
-	if d.Reason != "" {
-		h[hdrPrefix+"reason"] = d.Reason
-	}
-	if d.Detail != "" {
-		h[hdrPrefix+"detail"] = headerSafe(d.Detail)
-	}
-	if d.Stage > 0 {
-		h[hdrPrefix+"stage"] = fmt.Sprint(d.Stage)
-	}
-	if d.Stage == 2 {
-		h[hdrPrefix+"score"] = fmt.Sprintf("%.4f", d.Score)
-	}
-	h[hdrPrefix+"latency-us"] = fmt.Sprint(d.Latency.Microseconds())
-	return h
-}
-
-// promptText returns the user text of a chat or text-completion request.
-func promptText(req *schemas.BifrostRequest) string {
-	if req == nil {
-		return ""
-	}
-	if req.ChatRequest != nil {
-		var parts []string
-		for _, m := range req.ChatRequest.Input {
-			if m.Role != schemas.ChatMessageRoleUser || m.Content == nil {
-				continue
-			}
-			if m.Content.ContentStr != nil {
-				parts = append(parts, *m.Content.ContentStr)
-			}
-			for _, b := range m.Content.ContentBlocks {
-				if b.Text != nil {
-					parts = append(parts, *b.Text)
-				}
-			}
-		}
-		return strings.Join(parts, "\n")
-	}
-	if req.TextCompletionRequest != nil && req.TextCompletionRequest.Input != nil && req.TextCompletionRequest.Input.PromptStr != nil {
-		return *req.TextCompletionRequest.Input.PromptStr
-	}
-	return ""
-}
-
-// loopback re-sends the original request to this Bifrost with semantic lookup
-// disabled, so the client gets a freshly generated answer for its own question.
-func loopback(raw *rawRequest) (int, map[string]string, []byte, error) {
-	url := strings.TrimRight(cfg.LoopbackURL, "/") + raw.Path
-	if len(raw.Query) > 0 {
-		var q []string
-		for k, v := range raw.Query {
-			q = append(q, k+"="+v)
-		}
-		url += "?" + strings.Join(q, "&")
-	}
-	req, err := http.NewRequest(raw.Method, url, bytes.NewReader(raw.Body))
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	for k, v := range raw.Headers {
-		switch strings.ToLower(k) {
-		case "content-length", "host", "accept-encoding", "connection", "x-bf-cache-type":
-			continue
-		}
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("x-bf-cache-type", "direct")
-	req.Header.Set(bypassHeader, "1")
-	res, err := client.Do(req)
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	headers := map[string]string{}
-	for k := range res.Header {
-		headers[k] = res.Header.Get(k)
-	}
-	return res.StatusCode, headers, body, nil
-}
-
-// stage2Score asks the optional cross-encoder service whether a and b ask the same thing.
-func stage2Score(a, b string) (float64, error) {
-	payload, _ := json.Marshal(map[string]string{"a": a, "b": b})
-	c := &http.Client{Timeout: time.Duration(cfg.Stage2TimeoutMs) * time.Millisecond}
-	res, err := c.Post(cfg.Stage2URL, "application/json", bytes.NewReader(payload))
-	if err != nil {
-		return 0, err
-	}
-	defer res.Body.Close()
-	var out struct {
-		Score float64 `json:"score"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
-		return 0, err
-	}
-	return out.Score, nil
-}
-
 // promptStore remembers which question each cache entry was written for.
-// Bounded FIFO: the oldest entries are forgotten first (their hits become "unverified").
+// Bounded FIFO: the oldest entries are forgotten first (their hits then count as unknown).
 type promptStore struct {
 	mu    sync.RWMutex
 	max   int
-	m     map[string]string
+	m     map[string]storedPrompt
 	order []string
 }
 
 func newPromptStore(max int) *promptStore {
-	return &promptStore{max: max, m: make(map[string]string)}
+	return &promptStore{max: max, m: make(map[string]storedPrompt)}
 }
 
-func (s *promptStore) put(id, prompt string) {
+func (s *promptStore) put(id string, p storedPrompt) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.m[id]; !ok {
 		s.order = append(s.order, id)
 	}
-	s.m[id] = prompt
+	s.m[id] = p
 	for len(s.order) > s.max {
 		delete(s.m, s.order[0])
 		s.order = s.order[1:]
 	}
 }
 
-func (s *promptStore) get(id string) (string, bool) {
+func (s *promptStore) get(id string) (storedPrompt, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	p, ok := s.m[id]
 	return p, ok
+}
+
+func headerValue(h map[string]string, key string) string {
+	for k, v := range h {
+		if strings.EqualFold(k, key) {
+			return v
+		}
+	}
+	return ""
 }
 
 func copyMap(m map[string]string) map[string]string {
