@@ -68,6 +68,8 @@ type decision struct {
 	// Best-Before
 	Freshness        string // within-deadline | rechecked-fresh | stale | check-failed | not-time-sensitive
 	FreshDeadline    time.Time
+	ReviewEvery      time.Duration // review interval used for this answer
+	ReviewBasis      string        // "ttl" (fixed per category) or "max-stale-rate"
 	ClaimsChecked    int
 	StaleClaims      int
 	MinScore         int
@@ -75,6 +77,7 @@ type decision struct {
 	Evidence         string // evidence text for the regeneration (sources only)
 	EvidenceInjected string // "injected" | "not-injected" (regeneration after a stale claim)
 	CacheDelete      string // "ok" or the reason removing the old entry failed
+	Refresh          string // "started": a background refresh-ahead check began
 }
 
 type rawRequest struct {
@@ -333,7 +336,11 @@ func PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bif
 	// it can only hit an identical question, and it is sent without the cache key when
 	// the old entry could not be removed.
 	if regen, _ := ctx.Value(keyRegen).(bool); !regen && (d.Action == "pass" || d.Action == "unverified") {
-		bestBeforeOnHit(d, resp, prompt, cached, known)
+		var raw *rawRequest
+		if st, ok := ctx.Value(keyState).(*reqState); ok {
+			raw = st.raw
+		}
+		bestBeforeOnHit(d, resp, prompt, cached, known, raw)
 	}
 	publish(ctx, d)
 	ctx.Log(schemas.LogLevelInfo, fmt.Sprintf("cacheguard: %s hit -> %s (%s %s) in %s", d.HitType, d.Action, d.Reason, d.Detail, d.Latency))
@@ -454,6 +461,9 @@ func (d *decision) headers() map[string]string {
 		if !d.FreshDeadline.IsZero() {
 			h[hdrPrefix+"freshness-deadline"] = d.FreshDeadline.UTC().Format(time.RFC3339)
 		}
+		if d.ReviewEvery > 0 {
+			h[hdrPrefix+"review-every"] = fmt.Sprintf("%s (%s)", d.ReviewEvery.Round(time.Minute), d.ReviewBasis)
+		}
 		if d.ClaimsChecked > 0 || d.StaleClaims > 0 {
 			h[hdrPrefix+"claims-checked"] = fmt.Sprint(d.ClaimsChecked)
 			h[hdrPrefix+"stale-claims"] = fmt.Sprint(d.StaleClaims)
@@ -465,6 +475,9 @@ func (d *decision) headers() map[string]string {
 	}
 	if d.EvidenceInjected != "" {
 		h[hdrPrefix+"evidence"] = d.EvidenceInjected
+	}
+	if d.Refresh != "" {
+		h[hdrPrefix+"refresh"] = d.Refresh
 	}
 	if d.CacheDelete != "" {
 		h[hdrPrefix+"old-entry-removed"] = headerSafe(d.CacheDelete)

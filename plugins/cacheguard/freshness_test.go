@@ -324,3 +324,83 @@ func TestAdminAuthorizationFromEnv(t *testing.T) {
 		t.Errorf("explicit value must win, got %q", got)
 	}
 }
+
+func waitBackground(t *testing.T) {
+	t.Helper()
+	for i := 0; i < 200 && checkerQueue.Load() > 0; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if checkerQueue.Load() > 0 {
+		t.Fatal("background work did not finish")
+	}
+}
+
+func TestRefreshAheadFreshExtendsDeadlineInBackground(t *testing.T) {
+	var calls atomic.Int32
+	srv := fakeChecker(t, false, &calls)
+	defer srv.Close()
+	initBB(t, srv.URL, nil)
+	// statistics questions get a 24 h window; 23 h old = inside the last 20 %
+	store.put("r1", storedPrompt{prompt: repoQ, cachedAt: time.Now().Add(-23 * time.Hour)})
+	d := hit(t, repoQ, "r1", "direct")
+	if d.Action != "pass" || d.Freshness != "within-deadline" || d.Refresh != "started" {
+		t.Fatalf("hit must be served at once and start a refresh: %+v", d)
+	}
+	if d2 := hit(t, repoQ, "r1", "direct"); d2.Refresh == "started" && calls.Load() > 1 {
+		t.Error("only one refresh per entry at a time")
+	}
+	waitBackground(t)
+	if p, _ := store.get("r1"); time.Since(p.checkedAt) > time.Minute || calls.Load() != 1 {
+		t.Fatalf("deadline not extended (calls %d)", calls.Load())
+	}
+}
+
+func TestRefreshAheadNotTooEarly(t *testing.T) {
+	var calls atomic.Int32
+	srv := fakeChecker(t, true, &calls)
+	defer srv.Close()
+	initBB(t, srv.URL, nil)
+	store.put("r2", storedPrompt{prompt: repoQ, cachedAt: time.Now().Add(-1 * time.Hour)})
+	if d := hit(t, repoQ, "r2", "direct"); d.Refresh != "" {
+		t.Fatalf("1 h into a 24 h window must not refresh: %+v", d)
+	}
+	waitBackground(t)
+	if calls.Load() != 0 {
+		t.Error("no check expected")
+	}
+}
+
+func TestRefreshAheadStaleRegeneratesInBackground(t *testing.T) {
+	var deleted atomic.Value
+	var regenEvidence atomic.Value
+	var calls atomic.Int32
+	checker := fakeChecker(t, true, &calls)
+	defer checker.Close()
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodDelete:
+			deleted.Store(strings.TrimPrefix(r.URL.Path, "/api/cache/clear/"))
+		case http.MethodPost:
+			ev, _ := base64.StdEncoding.DecodeString(r.Header.Get(evidenceHeader))
+			regenEvidence.Store(string(ev))
+			w.Write([]byte(`{"choices":[]}`))
+		}
+	}))
+	defer gw.Close()
+	mustInit(t, map[string]any{"loopback_url": gw.URL, "best_before": map[string]any{"enabled": true, "checker_url": checker.URL, "check_on_store": false}})
+	store.put("r3", storedPrompt{prompt: repoQ, cachedAt: time.Now().Add(-23 * time.Hour)})
+	d := hit(t, repoQ, "r3", "direct")
+	if d.Action != "pass" || d.Refresh != "started" {
+		t.Fatalf("got %+v", d)
+	}
+	waitBackground(t)
+	if p, _ := store.get("r3"); !p.stale {
+		t.Error("stale entry must be marked so no hit serves it")
+	}
+	if deleted.Load() != "r3" {
+		t.Errorf("stale entry not removed: %v", deleted.Load())
+	}
+	if ev, _ := regenEvidence.Load().(string); !strings.Contains(ev, "5.50%") {
+		t.Errorf("background regeneration must carry the fresh evidence, got %q", ev)
+	}
+}

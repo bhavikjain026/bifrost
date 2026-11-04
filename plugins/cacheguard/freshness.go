@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +37,19 @@ type BestBeforeConfig struct {
 	TTLSeconds   map[string]int `json:"ttl_seconds"`    // per-category review deadline overrides
 	CheckOnStore *bool          `json:"check_on_store"` // check new time-sensitive answers in the background (default true)
 	OnCheckError string         `json:"on_check_error"` // "regenerate" (default) or "serve"
+
+	// Refresh-ahead: a hit in the last part of an answer's review window starts a
+	// background check (and, if stale, a background regeneration), so users rarely
+	// reach an expired answer and wait for a live check.
+	RefreshAhead  *bool   `json:"refresh_ahead"`  // default true
+	RefreshWindow float64 `json:"refresh_window"` // fraction of the review window, default 0.2
+
+	// Stale-rate target (slo.go): one number instead of per-category deadlines. The
+	// review interval per category comes from how often such answers change, and
+	// answers the detector does not flag are reviewed too. 0 = off (fixed deadlines).
+	MaxStaleRate    float64 `json:"max_stale_rate"`    // e.g. 0.02 = at most ~2% of hits stale
+	CheckerRecall   float64 `json:"checker_recall"`    // share of real changes the checker catches, default 1
+	ChangeRatesFile string  `json:"change_rates_file"` // optional: rates learned from your own traffic
 }
 
 // Shared with the cacheguard-evidence plugin through the request context.
@@ -86,6 +100,16 @@ func initBestBefore() error {
 	if bb.CheckOnStore == nil {
 		t := true
 		bb.CheckOnStore = &t
+	}
+	if bb.RefreshAhead == nil {
+		t := true
+		bb.RefreshAhead = &t
+	}
+	if bb.RefreshWindow <= 0 || bb.RefreshWindow >= 1 {
+		bb.RefreshWindow = 0.2
+	}
+	if err := initSLO(); err != nil {
+		return err
 	}
 	u, err := url.Parse(bb.CheckerURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -209,35 +233,71 @@ func answerText(resp *schemas.BifrostResponse) string {
 }
 
 // reviewDeadline: when a cached answer to this question must be re-checked.
-// ok=false means the question is not time-sensitive by our rules.
-func reviewDeadline(prompt string, cached storedPrompt, known bool) (time.Time, bool) {
+// ok=false means it is never reviewed: not time-sensitive by our rules (and no
+// max_stale_rate), or outside the detector's scope.
+func reviewDeadline(prompt string, cached storedPrompt, known bool) (time.Time, time.Duration, bool) {
 	r := bestbefore.Detect(prompt, timeNow())
-	if r.Status != bestbefore.Flagged {
-		return time.Time{}, false
+	var ttl time.Duration
+	switch {
+	case r.Status == bestbefore.Flagged:
+		ttl = bestbefore.TTLFor(r, cfg.BestBefore.TTLSeconds)
+		if iv, ok := sloInterval(r.Category); ok {
+			ttl = iv
+		}
+	case r.Status == bestbefore.NotFlagged:
+		iv, ok := sloInterval(notFlaggedGroup) // only with max_stale_rate on
+		if !ok {
+			return time.Time{}, 0, false
+		}
+		ttl = iv
+	default:
+		return time.Time{}, 0, false
 	}
-	ttl := bestbefore.TTLFor(r, cfg.BestBefore.TTLSeconds)
 	if !known {
-		return time.Time{}, true // age unknown (e.g. after a restart): check now
+		return time.Time{}, ttl, true // age unknown (e.g. after a restart): check now
 	}
-	base := cached.cachedAt
-	if cached.checkedAt.After(base) {
-		base = cached.checkedAt
+	return lastReview(cached).Add(ttl), ttl, true
+}
+
+// reviewCategory: the detector category, or the not-flagged group ("" if out of scope).
+func reviewCategory(prompt string) string {
+	switch r := bestbefore.Detect(prompt, timeNow()); r.Status {
+	case bestbefore.Flagged:
+		return r.Category
+	case bestbefore.NotFlagged:
+		return notFlaggedGroup
 	}
-	return base.Add(ttl), true
+	return ""
+}
+
+// lastReview: when the cached answer was last known fresh (stored or re-checked).
+func lastReview(p storedPrompt) time.Time {
+	if p.checkedAt.After(p.cachedAt) {
+		return p.checkedAt
+	}
+	return p.cachedAt
 }
 
 // bestBeforeOnHit runs after the compatibility checks passed. It may turn the
 // decision into a reject ("stale-claim") with evidence for the regeneration.
-func bestBeforeOnHit(d *decision, resp *schemas.BifrostResponse, prompt string, cached storedPrompt, known bool) {
+func bestBeforeOnHit(d *decision, resp *schemas.BifrostResponse, prompt string, cached storedPrompt, known bool, raw *rawRequest) {
 	if !cfg.BestBefore.Enabled || prompt == "" {
 		return
 	}
-	deadline, sensitive := reviewDeadline(prompt, cached, known)
+	deadline, ttl, sensitive := reviewDeadline(prompt, cached, known)
 	if !sensitive {
 		d.Freshness = "not-time-sensitive"
 		return
 	}
 	d.FreshDeadline = deadline
+	d.ReviewEvery, d.ReviewBasis = ttl, "ttl"
+	if sloIntervals != nil && ttl != 0 {
+		if cat := reviewCategory(prompt); cat != "" {
+			if iv, ok := sloInterval(cat); ok && iv == ttl {
+				d.ReviewBasis = "max-stale-rate"
+			}
+		}
+	}
 	switch {
 	case known && cached.stale:
 		d.Action, d.Reason, d.Freshness = "reject", "known-stale", "stale"
@@ -245,6 +305,11 @@ func bestBeforeOnHit(d *decision, resp *schemas.BifrostResponse, prompt string, 
 		return
 	case !deadline.IsZero() && timeNow().Before(deadline):
 		d.Freshness = "within-deadline"
+		if *cfg.BestBefore.RefreshAhead && deadline.Sub(timeNow()) < time.Duration(float64(ttl)*cfg.BestBefore.RefreshWindow) {
+			if startRefresh(d.CacheID, prompt, answerText(resp), raw, lastReview(cached)) {
+				d.Refresh = "started"
+			}
+		}
 		return
 	}
 	answer := answerText(resp)
@@ -278,10 +343,57 @@ func bestBeforeOnHit(d *decision, resp *schemas.BifrostResponse, prompt string, 
 	}
 	d.Freshness = "rechecked-fresh"
 	d.FreshDeadline = time.Time{}
-	if deadline2, ok := reviewDeadline(prompt, storedPrompt{cachedAt: timeNow()}, true); ok {
+	if deadline2, _, ok := reviewDeadline(prompt, storedPrompt{cachedAt: timeNow()}, true); ok {
 		d.FreshDeadline = deadline2
 	}
 	store.update(d.CacheID, func(p *storedPrompt) { p.checkedAt = timeNow() })
+}
+
+var refreshing sync.Map // cache id -> struct{}: one background refresh per entry at a time
+
+// startRefresh checks a cached answer in the background before its deadline. If a
+// claim is stale, the entry is marked (so no hit serves it), removed, and the
+// request is regenerated in the background with the fresh evidence, so the next
+// user gets the corrected answer from the cache. Returns false if a refresh for
+// this entry is already running, or one finished after `seen` (the last review this
+// request saw), so a request holding an older copy of the entry doesn't refresh twice.
+func startRefresh(cacheID, prompt, answer string, raw *rawRequest, seen time.Time) bool {
+	if cacheID == "" || answer == "" {
+		return false
+	}
+	if _, busy := refreshing.LoadOrStore(cacheID, struct{}{}); busy {
+		return false
+	}
+	if p, ok := store.get(cacheID); ok && lastReview(p).After(seen) {
+		refreshing.Delete(cacheID)
+		return false
+	}
+	checkerQueue.Add(1)
+	go func() {
+		defer checkerQueue.Add(-1)
+		defer refreshing.Delete(cacheID)
+		storeChecks <- struct{}{}
+		defer func() { <-storeChecks }()
+		res, err := checkFreshness(answer, prompt)
+		if err != nil {
+			dbg("refresh-ahead %s: check failed (%v); the deadline check will retry", cacheID, err)
+			return
+		}
+		if res.Summary.Stale == 0 {
+			store.update(cacheID, func(p *storedPrompt) { p.checkedAt = timeNow() })
+			dbg("refresh-ahead %s: still fresh, deadline extended", cacheID)
+			return
+		}
+		_, evidence := res.staleDetail()
+		store.update(cacheID, func(p *storedPrompt) { p.stale, p.evidence = true, evidence })
+		if raw == nil || cfg.Mode != "enforce" {
+			return
+		}
+		keep := deleteCacheEntry(cacheID) == nil
+		status, _, _, err := loopback(nil, raw, evidence, keep)
+		dbg("refresh-ahead %s: stale, removed=%v, regenerated status=%d err=%v", cacheID, keep, status, err)
+	}()
+	return true
 }
 
 // checkOnStore checks a newly cached time-sensitive answer in the background. A stale
