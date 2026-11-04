@@ -404,3 +404,113 @@ func TestRefreshAheadStaleRegeneratesInBackground(t *testing.T) {
 		t.Errorf("background regeneration must carry the fresh evidence, got %q", ev)
 	}
 }
+
+// fakeCheckerJSON serves a fixed checker reply and counts calls.
+func fakeCheckerJSON(t *testing.T, reply map[string]any, calls *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_ = json.NewEncoder(w).Encode(reply)
+	}))
+}
+
+// unconfirmedReply: a fast-changing claim the sources neither confirmed nor
+// contradicted, optionally with search results for the question.
+func unconfirmedReply(withResults bool) map[string]any {
+	r := map[string]any{
+		"claims": []map[string]any{{"text": "India's repo rate is 4%.", "flagged": true, "verdict": "not-enough-info",
+			"label": "unverified", "score": 35, "urgent": true}},
+		"summary": map[string]any{"flagged": 1, "checked": 1, "stale": 0, "unconfirmed": 1, "min_score": 35},
+	}
+	if withResults {
+		r["question_evidence"] = []map[string]any{{"line": "The RBI kept the repo rate at 5.50% on 1 October 2026.",
+			"url": "https://example.org/rbi", "published": "2026-10-01T00:00:00+00:00"}}
+	}
+	return r
+}
+
+func TestUnconfirmedClaimRegeneratesFromQuestionResults(t *testing.T) {
+	var calls atomic.Int32
+	srv := fakeCheckerJSON(t, unconfirmedReply(true), &calls)
+	defer srv.Close()
+	initBB(t, srv.URL, nil)
+	store.put("u1", storedPrompt{prompt: repoQ, cachedAt: time.Now().Add(-48 * time.Hour)})
+
+	d := hit(t, repoQ, "u1", "semantic")
+	if d.Action != "reject" || d.Reason != "unconfirmed-claim" || d.Freshness != "unconfirmed" || calls.Load() != 1 {
+		t.Fatalf("got %+v (calls %d)", d, calls.Load())
+	}
+	if !strings.Contains(d.Evidence, "5.50%") || !strings.Contains(d.Evidence, "could not confirm") {
+		t.Errorf("evidence must carry the search results and the honest fallback: %q", d.Evidence)
+	}
+	low := strings.ToLower(d.Evidence)
+	for _, bad := range []string{"out of date", "no longer current", "do not repeat older values"} {
+		if strings.Contains(low, bad) {
+			t.Errorf("an unconfirmed claim must never be called wrong (%q in %q)", bad, d.Evidence)
+		}
+	}
+	if p, _ := store.get("u1"); !p.stale || p.evidence != d.Evidence {
+		t.Error("entry must be marked for regeneration with this evidence")
+	}
+	if h := d.headers(); h[hdrPrefix+"unconfirmed-claims"] != "1" || h[hdrPrefix+"stale-claims"] != "0" || h[hdrPrefix+"freshness"] != "unconfirmed" {
+		t.Errorf("headers: %v", h)
+	}
+	// The next hit reuses that evidence without a new check, and still says unconfirmed.
+	if d2 := hit(t, repoQ, "u1", "direct"); d2.Reason != "known-unconfirmed" || d2.Freshness != "unconfirmed" || d2.Evidence != d.Evidence || calls.Load() != 1 {
+		t.Errorf("second hit: %+v calls %d", d2, calls.Load())
+	}
+}
+
+func TestUnconfirmedWithoutResultsIsServedAndRetriedSooner(t *testing.T) {
+	var calls atomic.Int32
+	srv := fakeCheckerJSON(t, unconfirmedReply(false), &calls)
+	defer srv.Close()
+	initBB(t, srv.URL, map[string]any{"refresh_ahead": false})
+	store.put("u2", storedPrompt{prompt: repoQ, cachedAt: time.Now().Add(-48 * time.Hour)})
+
+	d := hit(t, repoQ, "u2", "semantic")
+	if d.Action != "pass" || d.Freshness != "unconfirmed" || d.Evidence != "" || calls.Load() != 1 {
+		t.Fatalf("no better sources: serve it, marked unconfirmed. got %+v (calls %d)", d, calls.Load())
+	}
+	_, ttl, _ := reviewDeadline(repoQ, storedPrompt{cachedAt: time.Now()}, true)
+	retry := unconfirmedRetry(ttl)
+	if until := time.Until(d.FreshDeadline); until <= 0 || until > retry+time.Minute {
+		t.Errorf("next check should come after the short retry %s (ttl %s), deadline in %s", retry, ttl, until)
+	}
+	if p, _ := store.get("u2"); p.stale {
+		t.Error("an unconfirmed answer must not be marked stale")
+	}
+	if d2 := hit(t, repoQ, "u2", "semantic"); d2.Freshness != "within-deadline" || calls.Load() != 1 {
+		t.Errorf("inside the retry window no new check: %+v calls %d", d2, calls.Load())
+	}
+	timeNow = func() time.Time { return time.Now().Add(retry + time.Minute) }
+	defer func() { timeNow = time.Now }()
+	if hit(t, repoQ, "u2", "semantic"); calls.Load() != 2 {
+		t.Errorf("after the retry window it must be checked again, calls %d", calls.Load())
+	}
+}
+
+func TestOnUnconfirmedServe(t *testing.T) {
+	var calls atomic.Int32
+	srv := fakeCheckerJSON(t, unconfirmedReply(true), &calls)
+	defer srv.Close()
+	initBB(t, srv.URL, map[string]any{"on_unconfirmed": "serve", "refresh_ahead": false})
+	store.put("u3", storedPrompt{prompt: repoQ, cachedAt: time.Now().Add(-48 * time.Hour)})
+	if d := hit(t, repoQ, "u3", "semantic"); d.Action != "pass" || d.Freshness != "unconfirmed" {
+		t.Fatalf("on_unconfirmed=serve must serve: %+v", d)
+	}
+	if err := Init(map[string]any{"best_before": map[string]any{"enabled": true, "on_unconfirmed": "maybe"}}); err == nil {
+		t.Error("on_unconfirmed must be validated")
+	}
+}
+
+func TestUnconfirmedRetryBounds(t *testing.T) {
+	for _, c := range []struct{ ttl, want time.Duration }{
+		{time.Hour, 15 * time.Minute}, {5 * time.Minute, 5 * time.Minute}, {30 * time.Minute, 10 * time.Minute},
+		{240 * time.Hour, 6 * time.Hour},
+	} {
+		if got := unconfirmedRetry(c.ttl); got != c.want {
+			t.Errorf("unconfirmedRetry(%s) = %s, want %s", c.ttl, got, c.want)
+		}
+	}
+}

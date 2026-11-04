@@ -2,10 +2,18 @@ package main
 
 // Best-Before: time-sensitive cached answers get a review deadline. After it, a cache
 // hit is checked claim by claim against live web sources (the freshness checker
-// service, which uses Tavily) BEFORE it is served. If a claim is stale, the cache
-// entry is deleted and the answer is regenerated with the fresh evidence added (by
-// the small companion plugin "cacheguard-evidence"), so the new answer is built from
-// current sources and is cached in place of the old one.
+// service, which uses Tavily) BEFORE it is served. Each checked claim ends up
+// supported, contradicted or unconfirmed:
+//   - contradicted (sources state a different value): the cache entry is deleted and
+//     the answer is regenerated with the source lines added (by the small companion
+//     plugin "cacheguard-evidence"), and the new answer is cached in its place;
+//   - unconfirmed (a fast-changing claim the sources neither confirm nor contradict):
+//     this is not evidence the answer is wrong, so it is never called out of date. If
+//     a search on the question found relevant lines, the answer is regenerated from
+//     them, and the model is told to say so if they don't state the answer
+//     (on_unconfirmed "regenerate", the default). Otherwise it is served, marked
+//     unconfirmed, and checked again sooner;
+//   - supported: served, and the review deadline restarts.
 //
 // New time-sensitive answers are also checked in the background right after they are
 // cached (check_on_store), so a stale answer does not stay in the cache.
@@ -37,6 +45,10 @@ type BestBeforeConfig struct {
 	TTLSeconds   map[string]int `json:"ttl_seconds"`    // per-category review deadline overrides
 	CheckOnStore *bool          `json:"check_on_store"` // check new time-sensitive answers in the background (default true)
 	OnCheckError string         `json:"on_check_error"` // "regenerate" (default) or "serve"
+	// What to do when a fast-changing claim can be neither confirmed nor contradicted:
+	// "regenerate" (default) from search results for the question, if any were found;
+	// "serve" the cached answer, marked unconfirmed.
+	OnUnconfirmed string `json:"on_unconfirmed"`
 
 	// Refresh-ahead: a hit in the last part of an answer's review window starts a
 	// background check (and, if stale, a background regeneration), so users rarely
@@ -97,6 +109,12 @@ func initBestBefore() error {
 	if bb.OnCheckError != "regenerate" && bb.OnCheckError != "serve" {
 		return fmt.Errorf("cacheguard: best_before.on_check_error must be \"regenerate\" or \"serve\", got %q", bb.OnCheckError)
 	}
+	if bb.OnUnconfirmed == "" {
+		bb.OnUnconfirmed = "regenerate"
+	}
+	if bb.OnUnconfirmed != "regenerate" && bb.OnUnconfirmed != "serve" {
+		return fmt.Errorf("cacheguard: best_before.on_unconfirmed must be \"regenerate\" or \"serve\", got %q", bb.OnUnconfirmed)
+	}
 	if bb.CheckOnStore == nil {
 		t := true
 		bb.CheckOnStore = &t
@@ -121,27 +139,100 @@ func initBestBefore() error {
 	return nil
 }
 
+// evidenceLine is one line quoted from a web source.
+type evidenceLine struct {
+	Line      string `json:"line"`
+	URL       string `json:"url"`
+	Published string `json:"published"`
+}
+
 // checkResult mirrors the freshness checker's POST /check response (fields we use).
+// Label is "stale" only for a contradicted claim; Urgent marks fast-changing facts.
 type checkResult struct {
 	Claims []struct {
-		Text       string `json:"text"`
-		Flagged    bool   `json:"flagged"`
-		Verdict    string `json:"verdict"`
-		Label      string `json:"label"`
-		Score      int    `json:"score"`
-		NewerValue string `json:"newer_value"`
-		Evidence   []struct {
-			Line      string `json:"line"`
-			URL       string `json:"url"`
-			Published string `json:"published"`
-		} `json:"evidence"`
+		Text       string         `json:"text"`
+		Flagged    bool           `json:"flagged"`
+		Verdict    string         `json:"verdict"` // supported | contradicted | not-enough-info | not-checked
+		Label      string         `json:"label"`
+		Score      int            `json:"score"`
+		Urgent     bool           `json:"urgent"`
+		NewerValue string         `json:"newer_value"`
+		Evidence   []evidenceLine `json:"evidence"`
 	} `json:"claims"`
-	Summary struct {
-		Flagged  int  `json:"flagged"`
-		Checked  int  `json:"checked"`
-		Stale    int  `json:"stale"`
-		MinScore *int `json:"min_score"`
+	// Lines from one search on the question itself, sent when a fast-changing claim
+	// was unconfirmed and nothing was contradicted.
+	QuestionEvidence []evidenceLine `json:"question_evidence"`
+	Summary          struct {
+		Flagged     int  `json:"flagged"`
+		Checked     int  `json:"checked"`
+		Stale       int  `json:"stale"`       // contradicted claims
+		Unconfirmed int  `json:"unconfirmed"` // fast-changing claims neither confirmed nor contradicted
+		MinScore    *int `json:"min_score"`
 	} `json:"summary"`
+}
+
+// regenPlan says whether a checked answer must be regenerated, and with which
+// evidence. reason is "" when the answer may be served.
+func (r *checkResult) regenPlan() (reason, detail, evidence string) {
+	switch {
+	case r.Summary.Stale > 0:
+		detail, evidence = r.staleDetail()
+		return "stale-claim", detail, evidence
+	case r.Summary.Unconfirmed > 0 && cfg.BestBefore.OnUnconfirmed == "regenerate" && len(r.QuestionEvidence) > 0:
+		detail, evidence = r.unconfirmedDetail()
+		return "unconfirmed-claim", detail, evidence
+	}
+	return "", "", ""
+}
+
+func shortDate(s string) string {
+	if len(s) > 10 {
+		return s[:10]
+	}
+	return s
+}
+
+// unconfirmedDetail: evidence for regenerating an answer whose fast-changing claim
+// could not be confirmed. It gives the search results for the question and never says
+// the earlier answer was wrong.
+func (r *checkResult) unconfirmedDetail() (detail, evidence string) {
+	today := timeNow().UTC().Format("2006-01-02")
+	var details []string
+	for _, c := range r.Claims {
+		if c.Verdict == "not-enough-info" && c.Urgent {
+			details = append(details, "unconfirmed: "+c.Text)
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Web search results for this question (retrieved %s). An earlier answer could not be confirmed or ruled out from sources; that alone does not mean it was wrong.\n", today)
+	for i, e := range r.QuestionEvidence {
+		if i == 6 || b.Len() > 1500 {
+			break
+		}
+		fmt.Fprintf(&b, "- Source (%s, %s): %q\n", e.URL, shortDate(e.Published), e.Line)
+	}
+	fmt.Fprintf(&b, "Use these results only where they state the answer directly, and mention the source date. If they do not state it, give your best answer and say that you could not confirm it is current as of %s.\n", today)
+	ev := b.String()
+	if len(ev) > 2000 {
+		ev = ev[:2000]
+	}
+	return strings.Join(details, "; "), ev
+}
+
+// unconfirmedRetry: how soon to check again an answer that could not be confirmed
+// and has no better sources yet (a quarter of its review interval, 10 min to 6 h).
+func unconfirmedRetry(ttl time.Duration) time.Duration {
+	r := ttl / 4
+	if r < 10*time.Minute {
+		r = 10 * time.Minute
+	}
+	if r > 6*time.Hour {
+		r = 6 * time.Hour
+	}
+	if ttl > 0 && r > ttl {
+		r = ttl
+	}
+	return r
 }
 
 func checkFreshness(answer, question string) (*checkResult, error) {
@@ -169,7 +260,8 @@ func checkFreshness(answer, question string) (*checkResult, error) {
 }
 
 // staleDetail is a short header-safe summary; evidence is the text given to the model
-// when regenerating (only lines that came from the sources, never model text).
+// when regenerating (only lines that came from the sources, never model text). Only
+// contradicted claims (label "stale") are listed.
 func (r *checkResult) staleDetail() (detail, evidence string) {
 	var details []string
 	var b strings.Builder
@@ -188,17 +280,13 @@ func (r *checkResult) staleDetail() (detail, evidence string) {
 		if c.NewerValue != "" {
 			fmt.Fprintf(&b, "- Newest value found in the sources: %s (an older answer said: %q).\n", c.NewerValue, c.Text)
 		} else {
-			fmt.Fprintf(&b, "- This older statement is out of date: %q.\n", c.Text)
+			fmt.Fprintf(&b, "- Sources describe this older statement as no longer current: %q.\n", c.Text)
 		}
 		for i, e := range c.Evidence {
 			if i == 2 {
 				break
 			}
-			date := e.Published
-			if len(date) > 10 {
-				date = date[:10]
-			}
-			fmt.Fprintf(&b, "  Source (%s, %s): %q\n", e.URL, date, e.Line)
+			fmt.Fprintf(&b, "  Source (%s, %s): %q\n", e.URL, shortDate(e.Published), e.Line)
 		}
 		if b.Len() > 1800 {
 			break
@@ -301,6 +389,9 @@ func bestBeforeOnHit(d *decision, resp *schemas.BifrostResponse, prompt string, 
 	switch {
 	case known && cached.stale:
 		d.Action, d.Reason, d.Freshness = "reject", "known-stale", "stale"
+		if cached.unconfirmed {
+			d.Reason, d.Freshness = "known-unconfirmed", "unconfirmed"
+		}
 		d.Evidence = cached.evidence
 		return
 	case !deadline.IsZero() && timeNow().Before(deadline):
@@ -330,15 +421,27 @@ func bestBeforeOnHit(d *decision, resp *schemas.BifrostResponse, prompt string, 
 		}
 		return
 	}
-	d.ClaimsChecked, d.StaleClaims = res.Summary.Checked, res.Summary.Stale
+	d.ClaimsChecked, d.StaleClaims, d.UnconfirmedClaims = res.Summary.Checked, res.Summary.Stale, res.Summary.Unconfirmed
 	if res.Summary.MinScore != nil {
 		d.MinScore = *res.Summary.MinScore
 	}
-	if res.Summary.Stale > 0 {
-		d.Action, d.Reason, d.Freshness = "reject", "stale-claim", "stale"
-		d.Detail, d.Evidence = res.staleDetail()
-		ev := d.Evidence
-		store.update(d.CacheID, func(p *storedPrompt) { p.stale, p.evidence = true, ev })
+	if reason, detail, ev := res.regenPlan(); reason != "" {
+		d.Action, d.Reason, d.Detail, d.Evidence = "reject", reason, detail, ev
+		d.Freshness = "stale"
+		if reason == "unconfirmed-claim" {
+			d.Freshness = "unconfirmed"
+		}
+		unconfirmed := reason == "unconfirmed-claim"
+		store.update(d.CacheID, func(p *storedPrompt) { p.stale, p.evidence, p.unconfirmed = true, ev, unconfirmed })
+		return
+	}
+	if res.Summary.Unconfirmed > 0 {
+		// Could not confirm, and nothing better was found: serve it, marked
+		// unconfirmed, and check again sooner instead of restarting the full deadline.
+		retry := unconfirmedRetry(ttl)
+		d.Freshness = "unconfirmed"
+		d.FreshDeadline = timeNow().Add(retry)
+		store.update(d.CacheID, func(p *storedPrompt) { p.checkedAt = timeNow().Add(retry - ttl) })
 		return
 	}
 	d.Freshness = "rechecked-fresh"
@@ -379,25 +482,31 @@ func startRefresh(cacheID, prompt, answer string, raw *rawRequest, seen time.Tim
 			dbg("refresh-ahead %s: check failed (%v); the deadline check will retry", cacheID, err)
 			return
 		}
-		if res.Summary.Stale == 0 {
+		reason, _, evidence := res.regenPlan()
+		if reason == "" {
+			if res.Summary.Unconfirmed > 0 {
+				dbg("refresh-ahead %s: unconfirmed and no better sources; the deadline check will retry", cacheID)
+				return
+			}
 			store.update(cacheID, func(p *storedPrompt) { p.checkedAt = timeNow() })
 			dbg("refresh-ahead %s: still fresh, deadline extended", cacheID)
 			return
 		}
-		_, evidence := res.staleDetail()
-		store.update(cacheID, func(p *storedPrompt) { p.stale, p.evidence = true, evidence })
+		unconfirmed := reason == "unconfirmed-claim"
+		store.update(cacheID, func(p *storedPrompt) { p.stale, p.evidence, p.unconfirmed = true, evidence, unconfirmed })
 		if raw == nil || cfg.Mode != "enforce" {
 			return
 		}
 		keep := deleteCacheEntry(cacheID) == nil
 		status, _, _, err := loopback(nil, raw, evidence, keep)
-		dbg("refresh-ahead %s: stale, removed=%v, regenerated status=%d err=%v", cacheID, keep, status, err)
+		dbg("refresh-ahead %s: %s, removed=%v, regenerated status=%d err=%v", cacheID, reason, keep, status, err)
 	}()
 	return true
 }
 
-// checkOnStore checks a newly cached time-sensitive answer in the background. A stale
-// answer is marked (so any hit regenerates) and deleted from the cache.
+// checkOnStore checks a newly cached time-sensitive answer in the background. An answer
+// with a contradicted claim is marked (so any hit regenerates) and deleted from the
+// cache. An unconfirmed claim does not delete a freshly generated answer.
 func checkOnStore(cacheID, prompt, answer string) {
 	if !cfg.BestBefore.Enabled || !*cfg.BestBefore.CheckOnStore || answer == "" {
 		return

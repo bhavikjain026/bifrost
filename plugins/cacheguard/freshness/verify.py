@@ -160,6 +160,7 @@ class Check:
     query: str = ""
     credits: float = 0.0
     request_id: str = ""
+    urgent: bool = False              # fast-changing fact (review deadline <= 1 h)
 
 
 # A line that mentions the claimed value but says it is old, replaced or compared
@@ -275,7 +276,10 @@ def score(verdict: str, claim: Claim, evidence: list[Line], now: datetime) -> tu
     supported      75 + 25 x recency of the newest supporting source (<=30 days: 1, 365+ days: 0, undated: 0.5)
     not-enough-info  35 for fast-changing facts (deadline <= 1 h), else 50
     contradicted   10, or 5 when contradicting lines come from 2+ sources
-    Labels: >=70 fresh, 40-69 unverified, <40 stale."""
+    The label follows the verdict, not the score: supported = fresh, contradicted =
+    stale, anything else = unverified. "Could not confirm" is never "stale": a failed
+    search is not evidence that a claim changed. The score is a heuristic for ordering
+    claims, not a probability."""
     if verdict == "supported":
         dates = [l.published for l in evidence if l.published]
         if dates:
@@ -288,7 +292,7 @@ def score(verdict: str, claim: Claim, evidence: list[Line], now: datetime) -> tu
         s = 5 if len({l.source for l in evidence}) >= 2 else 10
     else:
         s = 35 if claim.ttl_seconds and claim.ttl_seconds <= 3600 else 50
-    label = "fresh" if s >= 70 else "stale" if s < 40 else "unverified"
+    label = {"supported": "fresh", "contradicted": "stale"}.get(verdict, "unverified")
     return s, label
 
 
@@ -301,6 +305,7 @@ class Config:
     max_results: int = 5
     live: bool = False             # ask Tavily for live fetches (max_age_hours=0)
     credits_per_hour: int = 100
+    question_search: bool = True   # one extra search on the question when a fast-changing claim is unconfirmed
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -309,12 +314,13 @@ class Config:
                    ollama_url=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"),
                    max_claims=int(os.environ.get("FRESHNESS_MAX_CLAIMS", "5")),
                    live=os.environ.get("FRESHNESS_LIVE", "") == "1",
-                   credits_per_hour=int(os.environ.get("FRESHNESS_CREDITS_PER_HOUR", "100")))
+                   credits_per_hour=int(os.environ.get("FRESHNESS_CREDITS_PER_HOUR", "100")),
+                   question_search=os.environ.get("FRESHNESS_QUESTION_SEARCH", "1") != "0")
 
 
 def check_claim(claim: Claim, question: str, cfg: Config, budget: Budget, search=tavily_search, now: datetime | None = None) -> Check:
     now = now or datetime.now(timezone.utc)
-    c = Check(query=search_query(claim, question))
+    c = Check(query=search_query(claim, question), urgent=bool(claim.ttl_seconds and claim.ttl_seconds <= 3600))
     if not cfg.api_key:
         c.verdict, c.reason, c.score, c.label = "not-checked", "no TAVILY_API_KEY", 0, "unverified"
         return c
@@ -349,3 +355,40 @@ def check_claim(claim: Claim, question: str, cfg: Config, budget: Budget, search
     c.evidence = [{"line": l.text, "url": l.url, "title": l.title,
                    "published": l.published.isoformat() if l.published else None} for l in ev]
     return c
+
+
+_QWORDS_STOP = {"what", "who", "whom", "which", "when", "where", "how", "many", "much", "the", "is", "are", "was",
+                "were", "does", "did", "has", "have", "of", "in", "on", "for", "and", "to", "a", "an", "this", "that",
+                "most", "recent", "latest", "current", "currently", "now", "today"}
+
+
+def question_evidence(question: str, cfg: Config, budget: Budget, search=tavily_search, max_lines: int = 6) -> tuple[list[dict], float, str]:
+    """One search on the question itself, used when a fast-changing claim could be
+    neither confirmed nor contradicted. Returns source lines only (no verdict): the
+    regeneration may use them, and must say so when they don't state the answer."""
+    if not question.strip():
+        return [], 0.0, "no question"
+    if not cfg.api_key:
+        return [], 0.0, "no TAVILY_API_KEY"
+    if not budget.reserve(1.0):
+        return [], 0.0, "hourly credit cap reached"
+    try:
+        res = search(question.strip()[:380], cfg.api_key, max_results=cfg.max_results, live=cfg.live)
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        return [], 0.0, f"search failed: {e}"
+    credits = float((res.get("usage") or {}).get("credits", 1))
+    words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9+#.'-]{2,}", question) if w.lower() not in _QWORDS_STOP]
+    per_source: dict[int, int] = {}
+    out = []
+    for l in evidence_lines(res.get("results", [])):
+        low = l.text.lower()
+        if words and sum(1 for w in words if w in low) < min(2, len(words)):
+            continue
+        if per_source.get(l.source, 0) >= 2:
+            continue
+        per_source[l.source] = per_source.get(l.source, 0) + 1
+        out.append({"line": l.text, "url": l.url, "title": l.title,
+                    "published": l.published.isoformat() if l.published else None})
+        if len(out) >= max_lines:
+            break
+    return out, credits, "" if out else "no relevant line"

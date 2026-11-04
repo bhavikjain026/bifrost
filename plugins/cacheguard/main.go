@@ -66,18 +66,19 @@ type decision struct {
 	CacheID        string
 
 	// Best-Before
-	Freshness        string // within-deadline | rechecked-fresh | stale | check-failed | not-time-sensitive
-	FreshDeadline    time.Time
-	ReviewEvery      time.Duration // review interval used for this answer
-	ReviewBasis      string        // "ttl" (fixed per category) or "max-stale-rate"
-	ClaimsChecked    int
-	StaleClaims      int
-	MinScore         int
-	CheckLatency     time.Duration
-	Evidence         string // evidence text for the regeneration (sources only)
-	EvidenceInjected string // "injected" | "not-injected" (regeneration after a stale claim)
-	CacheDelete      string // "ok" or the reason removing the old entry failed
-	Refresh          string // "started": a background refresh-ahead check began
+	Freshness         string // within-deadline | rechecked-fresh | stale | unconfirmed | check-failed | not-time-sensitive
+	FreshDeadline     time.Time
+	ReviewEvery       time.Duration // review interval used for this answer
+	ReviewBasis       string        // "ttl" (fixed per category) or "max-stale-rate"
+	ClaimsChecked     int
+	StaleClaims       int // contradicted by sources
+	UnconfirmedClaims int // fast-changing, neither confirmed nor contradicted
+	MinScore          int
+	CheckLatency      time.Duration
+	Evidence          string // evidence text for the regeneration (sources only)
+	EvidenceInjected  string // "injected" | "not-injected" (regeneration after a stale claim)
+	CacheDelete       string // "ok" or the reason removing the old entry failed
+	Refresh           string // "started": a background refresh-ahead check began
 }
 
 type rawRequest struct {
@@ -103,8 +104,10 @@ type storedPrompt struct {
 	system    string    // exact system/developer prefix the answer was generated with
 	cachedAt  time.Time // when the answer was cached
 	checkedAt time.Time // last time a freshness check found no stale claim
-	stale     bool      // a freshness check found a stale claim: never serve
+	stale     bool      // a check found a contradicted claim (or better sources for an unconfirmed one): never serve
 	evidence  string    // fresh source lines from that check, reused for every regeneration
+
+	unconfirmed bool // the regeneration is for an unconfirmed claim, not a contradicted one
 }
 
 const (
@@ -411,7 +414,8 @@ func regenerate(ctx *schemas.BifrostContext, req *schemas.HTTPRequest, resp *sch
 		return
 	}
 	keepCacheKey := true
-	if d.Reason == "stale-claim" || d.Reason == "known-stale" || d.Reason == "freshness-check-failed" {
+	switch d.Reason {
+	case "stale-claim", "unconfirmed-claim", "known-stale", "known-unconfirmed", "freshness-check-failed":
 		// The regeneration has the same question, so it would hit this same entry again.
 		// Remove the entry first, so the regenerated answer is cached in its place. If that
 		// fails, regenerate without the cache so the old entry cannot be hit again.
@@ -467,6 +471,7 @@ func (d *decision) headers() map[string]string {
 		if d.ClaimsChecked > 0 || d.StaleClaims > 0 {
 			h[hdrPrefix+"claims-checked"] = fmt.Sprint(d.ClaimsChecked)
 			h[hdrPrefix+"stale-claims"] = fmt.Sprint(d.StaleClaims)
+			h[hdrPrefix+"unconfirmed-claims"] = fmt.Sprint(d.UnconfirmedClaims)
 			h[hdrPrefix+"freshness-check-ms"] = fmt.Sprint(d.CheckLatency.Milliseconds())
 		}
 		if d.MinScore >= 0 {

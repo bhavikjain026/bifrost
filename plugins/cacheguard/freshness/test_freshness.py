@@ -108,6 +108,55 @@ class TestCheck(unittest.TestCase):
 
 
 
+class TestUnconfirmed(unittest.TestCase):
+    """Could not confirm is not the same as out of date (FreshQA run, 4 Nov 2026: a
+    fast-changing claim with no deciding line used to be labelled stale, and the
+    regeneration was told the answer was out of date with no source)."""
+    cfg = Config(api_key="test")
+    answer = "Bitcoin is trading around $68,000."
+    unrelated = [{"url": "https://x.example", "title": "Crypto", "content": "Crypto markets were busy this week."}]
+
+    def test_unconfirmed_fast_claim_is_not_stale(self):
+        r = check_answer(self.answer, cfg=self.cfg, budget=Budget(100), search=fake_search(self.unrelated))
+        c = r["claims"][0]
+        self.assertEqual(c["verdict"], "not-enough-info")
+        self.assertEqual(c["label"], "unverified")
+        self.assertTrue(c["urgent"])
+        self.assertEqual((r["summary"]["stale"], r["summary"]["unconfirmed"]), (0, 1))
+        self.assertEqual(r["question_evidence"], [])  # no question given: no extra search
+
+    def test_question_search_returns_relevant_lines_only(self):
+        q_results = [{"url": "https://prices.example/btc", "title": "BTC", "published_date": "2026-11-04",
+                      "content": "Bitcoin price today is $91,200. Weather in London is mild."}]
+        calls = []
+
+        def search(query, api_key, max_results=5, live=False):
+            calls.append(query)
+            res = self.unrelated if len(calls) == 1 else q_results
+            return {"usage": {"credits": 1}, "results": res}
+        r = check_answer(self.answer, "What is the price of Bitcoin today?", cfg=self.cfg, budget=Budget(100), search=search)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], "What is the price of Bitcoin today?")
+        self.assertEqual([e["line"] for e in r["question_evidence"]], ["Bitcoin price today is $91,200."])
+        self.assertEqual(r["summary"]["credits"], 2)
+
+    def test_no_question_search_when_contradicted_or_disabled(self):
+        res = [{"url": f"https://n{i}.example", "title": "BTC", "content": "Bitcoin is trading around $91,200 today."} for i in range(2)]
+        s = fake_search(res)
+        r = check_answer(self.answer, "What is the price of Bitcoin?", cfg=self.cfg, budget=Budget(100), search=s)
+        self.assertEqual(r["summary"]["stale"], 1)
+        self.assertEqual(len(s.calls), 1)
+        s2 = fake_search(self.unrelated)
+        off = Config(api_key="test", question_search=False)
+        r2 = check_answer(self.answer, "What is the price of Bitcoin?", cfg=off, budget=Budget(100), search=s2)
+        self.assertEqual((r2["summary"]["unconfirmed"], len(s2.calls), r2["question_evidence"]), (1, 1, []))
+
+    def test_slow_unconfirmed_claim_triggers_nothing(self):
+        r = check_answer("ChatGPT Plus costs $20 per month.", "How much is ChatGPT Plus?", cfg=self.cfg,
+                         budget=Budget(100), search=fake_search(self.unrelated))
+        self.assertEqual((r["summary"]["stale"], r["summary"]["unconfirmed"]), (0, 0))
+
+
 class TestRealCases(unittest.TestCase):
     """Regression cases from the first live run (3 Nov 2026): the rules-only mode wrongly
     called these supported because the old value merely appeared in a source line."""

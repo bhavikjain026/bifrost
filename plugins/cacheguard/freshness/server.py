@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from claims import flag
-from verify import Budget, Config, check_claim
+from verify import Budget, Config, check_claim, question_evidence
 
 CFG = Config.from_env()
 BUDGET = Budget(CFG.credits_per_hour)
@@ -45,15 +45,26 @@ def check_answer(answer: str, question: str = "", cfg: Config = CFG, budget: Bud
             item.update({"verdict": "not-checked", "reason": f"over max_claims={cfg.max_claims}", "score": 0, "label": "unverified"})
         out.append(item)
     scored = [x for x in out if x.get("verdict") in ("supported", "contradicted", "not-enough-info")]
+    # A fast-changing claim the sources neither confirmed nor contradicted is
+    # "unconfirmed", not stale. If there is one (and nothing is contradicted), search
+    # the question itself once, so the gateway can regenerate from current sources.
+    unconfirmed = sum(1 for x in scored if x["verdict"] == "not-enough-info" and x.get("urgent"))
+    stale = sum(1 for x in scored if x["label"] == "stale")
+    qev, qcredits, qwhy = [], 0.0, ""
+    if unconfirmed and not stale and question and cfg.question_search:
+        qev, qcredits, qwhy = question_evidence(question, cfg, budget, **kwargs)
     return {
         "claims": out,
+        "question_evidence": qev,
+        "question_evidence_reason": qwhy,
         "summary": {
             "claims": len(claims),
             "flagged": sum(1 for c in claims if c.flagged),
             "checked": len(scored),
-            "stale": sum(1 for x in scored if x["label"] == "stale"),
+            "stale": stale,
+            "unconfirmed": unconfirmed,
             "min_score": min((x["score"] for x in scored), default=None),
-            "credits": sum(x.get("credits", 0) for x in out),
+            "credits": sum(x.get("credits", 0) for x in out) + qcredits,
             "mode": f"judge:{cfg.judge_model}" if cfg.judge_model else "rules",
             "ms": round((time.time() - t0) * 1000),
         },

@@ -20,7 +20,8 @@ allow to serve an out-of-date answer.
 ## What it does
 - Each category gets a review interval from how often its answers really change:
   `interval = k / √rate`, with `k` chosen so the expected stale share equals the target.
-  This puts checks where they buy the most freshness.
+  (In theory this spreads checks where they buy the most freshness; on FreshQA it did not
+  beat one well-chosen interval for everything, see below.)
 - **Answers the detector does not flag are reviewed too** (group `not-flagged`). Without
   this, they are never re-checked.
 - Real-time categories (`markets`, `weather_ops`, `live_results`) keep their short fixed
@@ -41,10 +42,25 @@ replayed on Feb 2025 to Apr 2026 (444 days, never seen when learning). See
 | never re-check | 24.3% | 0 |
 | fixed deadlines (the plugin without this setting) | 15.6% | 252 |
 | `max_stale_rate: 0.02` | 1.5% | 88 |
-| `max_stale_rate: 0.02`, `checker_recall: 0.6` | 1.2% | 178 |
+| one interval for everything, best value picked afterwards (about every 14 days) | 1.5% | 70 |
+| `max_stale_rate: 0.02`, `checker_recall: 0.6` (checker catches 60% of changes) | 1.2% | 178 |
+| one interval for everything, best value picked afterwards, same 60% checker | 1.2% | 179 |
 
-The target held on the test period at every level tried (0.5%, 1%, 2%, 5%), including
-with a checker that catches only 60% of changes.
+What this shows, and what it doesn't:
+- The target held on the 444 unseen days at every level tried (0.5%, 1%, 2%, 5%), with a
+  perfect checker and with one that catches only 60% of changes.
+- It does **not** need fewer checks than one well-chosen interval for everything. With a
+  perfect checker it used about 26% more than the best single interval (picked with
+  hindsight); with the 60% checker, about the same. The gain is that you state the risk
+  you accept and the intervals follow from learned change rates and checker recall: you
+  don't have to know the right interval in advance, and a weaker checker automatically
+  gets shorter intervals.
+- One likely reason the per-category split doesn't help here: three quarters of the
+  questions are not flagged by the detector, so they all share one group and one interval.
+- Denominator: every simulated request (432 questions x 444 days = 191,808), all served
+  from the cache. A review due that day happens before the answer is served.
+- Full tables: `cacheguard-replay/freshqa/timetravel/sim_report_detector.md` and
+  `sim_report_detector_recall60.md` (rows `plugin-slo@...`).
 
 ## Limits
 - Rates are learned from FreshQA's English trivia-style questions. For real traffic,
